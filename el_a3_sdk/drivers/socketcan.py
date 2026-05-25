@@ -21,16 +21,10 @@ from el_a3_sdk.protocol import (
 from el_a3_sdk.data_types import (
     MotorFeedback, ParamReadResult, FirmwareVersion,
 )
+from el_a3_sdk.drivers.timing import busy_wait_us
 from el_a3_sdk.utils import float_to_uint16, uint16_to_float
 
-logger = logging.getLogger("el_a3_sdk.can_driver")
-
-
-def _busy_wait_us(us: int):
-    """微秒级忙等待（精度 ~1-5us，远优于 time.sleep 的 ~1ms）"""
-    target = time.perf_counter() + us * 1e-6
-    while time.perf_counter() < target:
-        pass
+logger = logging.getLogger("el_a3_sdk.drivers.socketcan")
 
 
 # CAN 帧结构: can_id (4B) + dlc (1B) + padding (3B) + data (8B) = 16B
@@ -268,11 +262,11 @@ class RobstrideCanDriver:
                     self._tx_ok_window_count += 1
                     return True
                 except (socket.timeout, TimeoutError):
-                    _busy_wait_us(200 << attempt)
+                    busy_wait_us(200 << attempt)
                     continue
                 except OSError as e:
                     if e.errno in (105, 11, 110):  # ENOBUFS / EAGAIN / ETIMEDOUT
-                        _busy_wait_us(200 << attempt)
+                        busy_wait_us(200 << attempt)
                         continue
                     logger.error("发送 CAN 帧失败 [%s]: %s", self.can_name, e)
                     self._tx_fail_count += 1

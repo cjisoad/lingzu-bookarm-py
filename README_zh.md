@@ -43,8 +43,8 @@
 └──────────────────────┬───────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────┐
-│            RobstrideCanDriver (SocketCAN)              │
-│            CAN 2.0 扩展帧 · 29位 ID · 1Mbps           │
+│        drivers.create_can_driver()                    │
+│        SocketCAN / SLCAN · CAN 2.0 扩展帧             │
 └──────────────────────┬───────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────┐
@@ -404,12 +404,12 @@ el_a3_sdk/
 ├── __init__.py          # 包入口
 ├── interface.py         # ELA3Interface — 主接口 + 控制循环
 ├── arm_manager.py       # ArmManager — 多臂管理器
-├── can_driver.py        # SocketCAN 底层驱动
+├── drivers/             # SocketCAN / SLCAN 驱动包
 ├── protocol.py          # 协议枚举、电机参数、关节配置
 ├── data_types.py        # 数据结构 (SI 单位)
 ├── kinematics.py        # Pinocchio FK/IK/Jacobian/Gravity
 ├── realsense/           # RealSense RGB-D 采集、点云和选点工具
-├── trajectory.py        # S-curve + 三次样条轨迹规划
+├── motion/              # S-curve、三次样条和笛卡尔轨迹辅助
 ├── utils.py             # 工具函数
 ├── pyproject.toml       # pip 安装配置
 └── demo/

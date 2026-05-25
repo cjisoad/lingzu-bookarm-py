@@ -187,6 +187,9 @@ class MainWindow(QMainWindow):
         self.joint_panel.joint_command.connect(
             lambda pos: self.worker.submit_command("joint_ctrl", pos)
         )
+        self.joint_panel.go_zero_requested.connect(
+            lambda pos: self.worker.submit_command("move_j", pos, 3.0)
+        )
 
         tp = self.trajectory_panel
         tp.move_j_requested.connect(

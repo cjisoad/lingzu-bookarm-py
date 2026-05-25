@@ -17,11 +17,21 @@ EL-A3 机械臂 SDK 主接口（纯 Python，无 ROS 依赖）
 import time
 import threading
 import logging
-from typing import Dict, List, Optional, Tuple, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from el_a3_sdk.can_driver import RobstrideCanDriver, _busy_wait_us
+from el_a3_sdk.drivers import create_can_driver
+from el_a3_sdk.drivers.timing import busy_wait_us
+from el_a3_sdk.motion import (
+    CubicSplinePlanner,
+    MultiJointPlanner,
+    TrajectoryPoint,
+    fill_trajectory_derivatives,
+    interpolate_pose,
+    sample_trajectory,
+    smooth_time_scale,
+)
 from el_a3_sdk.protocol import (
     MotorType, RunMode, ControlMode, MoveMode, ModeState, ArmState,
     MotorParams, ParamIndex, LogLevel,
@@ -35,7 +45,7 @@ from el_a3_sdk.data_types import (
     ParamReadResult, FirmwareVersion,
     DynamicsInfo, TrajectoryResult,
 )
-from el_a3_sdk.utils import clamp, slerp_euler
+from el_a3_sdk.utils import clamp
 
 
 logger = logging.getLogger("el_a3_sdk")
@@ -58,7 +68,7 @@ class ELA3Interface:
         arm = ELA3Interface(can_name="can0")
         arm.ConnectPort()
         arm.EnableArm()
-        arm.JointCtrl(0.0, 1.57, -0.78, 0.0, 0.0, 0.0)
+        arm.d(0.0, 1.57, -0.78, 0.0, 0.0, 0.0)
         print(arm.GetArmJointMsgs())
         arm.DisableArm()
         arm.DisconnectPort()
@@ -153,22 +163,15 @@ class ELA3Interface:
             _sdk_logger.addHandler(_handler)
 
         self._can_name = can_name
-        if backend == "slcan":
-            from el_a3_sdk.slcan_can_driver import SlcanCanDriver
-            port = serial_port or can_name
-            self._driver = SlcanCanDriver(
-                serial_port=port,
-                host_can_id=host_can_id,
-                motor_type_map=motor_type_map,
-                serial_baudrate=serial_baudrate,
-                can_bitrate=can_bitrate,
-            )
-        else:
-            self._driver = RobstrideCanDriver(
-                can_name=can_name,
-                host_can_id=host_can_id,
-                motor_type_map=motor_type_map,
-            )
+        self._driver = create_can_driver(
+            backend=backend,
+            can_name=can_name,
+            host_can_id=host_can_id,
+            motor_type_map=motor_type_map,
+            serial_port=serial_port,
+            serial_baudrate=serial_baudrate,
+            can_bitrate=can_bitrate,
+        )
         self._joint_directions = joint_directions or dict(DEFAULT_JOINT_DIRECTIONS)
         self._joint_offsets = joint_offsets or dict(DEFAULT_JOINT_OFFSETS)
         self._joint_limits = joint_limits or dict(DEFAULT_JOINT_LIMITS)
@@ -395,8 +398,12 @@ class ELA3Interface:
                        self._trajectory[self._traj_index + 1].time <= elapsed):
                     self._traj_index += 1
 
-                positions, velocities = self._sample_trajectory(
-                    self._trajectory, self._traj_index, elapsed)
+                positions, velocities = sample_trajectory(
+                    self._trajectory,
+                    self._traj_index,
+                    elapsed,
+                    self.NUM_ARM_JOINTS,
+                )
                 with self._cmd_lock:
                     for i in range(min(len(positions), self.NUM_ARM_JOINTS)):
                         self._target_positions[i] = positions[i]
@@ -508,7 +515,7 @@ class ELA3Interface:
                 self._driver.send_motion_control(
                     mid, motor_pos, motor_vel, motor_kp, motor_kd, grav_torque)
 
-            _busy_wait_us(150)
+            busy_wait_us(150)
 
         self._last_cmd_positions = list(clamped_positions)
 
@@ -516,47 +523,6 @@ class ELA3Interface:
         if gripper_dirty and not zero_torque:
             gripper_motor_id = 7
             self._driver.set_position_pp(gripper_motor_id, gripper_target)
-
-    def _sample_trajectory(self, traj_points: List, index: int, elapsed: float) -> Tuple[List[float], List[float]]:
-        """按当前时间在线性插值轨迹点，避免控制循环输出阶梯目标。"""
-        if not traj_points:
-            return [], []
-
-        if len(traj_points) == 1 or elapsed <= traj_points[0].time:
-            pt = traj_points[0]
-            velocities = list(pt.velocities) if pt.velocities else [0.0] * len(pt.positions)
-            return list(pt.positions), velocities
-
-        last = traj_points[-1]
-        if elapsed >= last.time:
-            velocities = list(last.velocities) if last.velocities else [0.0] * len(last.positions)
-            return list(last.positions), velocities
-
-        idx = max(0, min(index, len(traj_points) - 2))
-        p0 = traj_points[idx]
-        p1 = traj_points[idx + 1]
-        seg_dt = max(p1.time - p0.time, 1e-9)
-        u = clamp((elapsed - p0.time) / seg_dt, 0.0, 1.0)
-
-        n = min(len(p0.positions), len(p1.positions), self.NUM_ARM_JOINTS)
-        positions = [
-            p0.positions[i] + u * (p1.positions[i] - p0.positions[i])
-            for i in range(n)
-        ]
-
-        if p0.velocities and p1.velocities:
-            nv = min(len(p0.velocities), len(p1.velocities), self.NUM_ARM_JOINTS)
-            velocities = [
-                p0.velocities[i] + u * (p1.velocities[i] - p0.velocities[i])
-                for i in range(nv)
-            ]
-        else:
-            velocities = [
-                (p1.positions[i] - p0.positions[i]) / seg_dt
-                for i in range(n)
-            ]
-
-        return positions, velocities
 
     def _read_feedback_positions(self) -> List[float]:
         """读取所有臂关节的反馈位置（URDF 坐标系）"""
@@ -851,7 +817,7 @@ class ELA3Interface:
             if not self._driver.send_motion_control(
                     mid, motor_pos, motor_vel, motor_kp, motor_kd, torque):
                 success = False
-            _busy_wait_us(150)
+            busy_wait_us(150)
 
         return success
 
@@ -950,7 +916,7 @@ class ELA3Interface:
                     direction = self._joint_directions.get(mid, 1.0)
                     motor_torque = grav[i] * direction if i < len(grav) else 0.0
                     self._driver.send_motion_control(mid, current_pos, 0.0, 0.0, kd, motor_torque)
-                    _busy_wait_us(150)
+                    busy_wait_us(150)
             logger.warning("零力矩模式已启用 (Kd=%.3f, adaptive=%s)",
                            kd, "ON" if self._adaptive_kd_enabled else "OFF")
         else:
@@ -1456,8 +1422,6 @@ class ELA3Interface:
             logger.error("未连接")
             return False
 
-        from el_a3_sdk.trajectory import MultiJointPlanner, TrajectoryPoint
-
         if self._control_running:
             fb = self._read_feedback_positions()
             start_q = list(fb)
@@ -1549,8 +1513,6 @@ class ELA3Interface:
             current_q = self.GetArmJointMsgs().to_list()[:self.NUM_ARM_JOINTS]
         start_pose = kin.forward_kinematics(current_q)
 
-        from el_a3_sdk.trajectory import TrajectoryPoint
-
         duration = max(float(duration), self._control_period)
         sample_dt = max(self._control_period * 2.0, 0.01) if self._control_running else 0.01
         sample_count = max(int(n_waypoints), int(np.ceil(duration / sample_dt)), 2)
@@ -1571,16 +1533,8 @@ class ELA3Interface:
 
         for i in range(1, sample_count + 1):
             tau = i / sample_count
-            s = self._smooth_time_scale(tau)
-            interp_rx, interp_ry, interp_rz = slerp_euler(
-                start_pose.rx, start_pose.ry, start_pose.rz,
-                target_pose.rx, target_pose.ry, target_pose.rz, s)
-            wp = ArmEndPose(
-                x=start_pose.x + s * (target_pose.x - start_pose.x),
-                y=start_pose.y + s * (target_pose.y - start_pose.y),
-                z=start_pose.z + s * (target_pose.z - start_pose.z),
-                rx=interp_rx, ry=interp_ry, rz=interp_rz,
-            )
+            s = smooth_time_scale(tau)
+            wp = interpolate_pose(start_pose, target_pose, s)
             q_sol = None
             q_seed = list(q_prev)
             err_norm = float("inf")
@@ -1617,7 +1571,7 @@ class ELA3Interface:
             ))
             q_prev = q_sol
 
-        self._fill_trajectory_derivatives(traj_points)
+        fill_trajectory_derivatives(traj_points, self.NUM_ARM_JOINTS)
 
         if self._control_running:
             return self._execute_trajectory_async(traj_points, block=block)
@@ -1637,54 +1591,6 @@ class ELA3Interface:
             if sleep_time > 0:
                 time.sleep(sleep_time)
         return True
-
-    @staticmethod
-    def _smooth_time_scale(tau: float) -> float:
-        """五次时间缩放：位置、速度、加速度在起止点连续。"""
-        tau = clamp(tau, 0.0, 1.0)
-        return tau * tau * tau * (10.0 + tau * (-15.0 + 6.0 * tau))
-
-    def _fill_trajectory_derivatives(self, traj_points: List):
-        """用中心差分给轨迹补速度/加速度前馈，减少每点停顿感。"""
-        if not traj_points:
-            return
-        n_joints = min(len(traj_points[0].positions), self.NUM_ARM_JOINTS)
-        zeros = [0.0] * n_joints
-        if len(traj_points) < 3:
-            for pt in traj_points:
-                pt.velocities = list(zeros)
-                pt.accelerations = list(zeros)
-            return
-
-        velocities = []
-        accelerations = []
-        for idx, pt in enumerate(traj_points):
-            if idx == 0 or idx == len(traj_points) - 1:
-                velocities.append(list(zeros))
-                accelerations.append(list(zeros))
-                continue
-
-            prev_pt = traj_points[idx - 1]
-            next_pt = traj_points[idx + 1]
-            dt = max(next_pt.time - prev_pt.time, 1e-9)
-            velocities.append([
-                (next_pt.positions[j] - prev_pt.positions[j]) / dt
-                for j in range(n_joints)
-            ])
-
-            dt_prev = max(pt.time - prev_pt.time, 1e-9)
-            dt_next = max(next_pt.time - pt.time, 1e-9)
-            accelerations.append([
-                2.0 * (
-                    (next_pt.positions[j] - pt.positions[j]) / dt_next
-                    - (pt.positions[j] - prev_pt.positions[j]) / dt_prev
-                ) / (dt_prev + dt_next)
-                for j in range(n_joints)
-            ])
-
-        for pt, vel, acc in zip(traj_points, velocities, accelerations):
-            pt.velocities = vel
-            pt.accelerations = acc
 
     def _execute_trajectory_async(self, traj_points: List, block: bool = True) -> bool:
         """将轨迹推入控制循环队列"""
@@ -1792,8 +1698,6 @@ class ELA3Interface:
         if len(durations) != len(waypoints) - 1:
             logger.error("durations 长度必须为 len(waypoints) - 1")
             return False
-
-        from el_a3_sdk.trajectory import CubicSplinePlanner
 
         dt = self._control_period if self._control_running else 0.005
         traj = CubicSplinePlanner.plan_waypoints(waypoints, durations, dt=dt)

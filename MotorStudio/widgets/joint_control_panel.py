@@ -31,7 +31,7 @@ class JointControlPanel(QWidget):
     """7 关节手动控制面板"""
 
     joint_command = pyqtSignal(list)  # 7 个弧度值
-    go_zero_requested = pyqtSignal()
+    go_zero_requested = pyqtSignal(list)  # 6 个弧度值（MoveJ 规划型回零）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -180,13 +180,16 @@ class JointControlPanel(QWidget):
 
     def _on_go_zero(self):
         self._updating_from_feedback = True
+        positions_rad = []
         for i in range(7):
             lo, hi = JOINT_LIMITS_DEG[i + 1]
             zero_val = 0.0 if lo <= 0.0 <= hi else lo
             self._spinboxes[i].setValue(zero_val)
             self._sliders[i].setValue(self._deg_to_slider(i, zero_val))
+            if i < 6:
+                positions_rad.append(math.radians(zero_val))
         self._updating_from_feedback = False
-        self._emit_command()
+        self.go_zero_requested.emit(positions_rad)
 
     def _sync_to_feedback(self):
         """将控制滑块同步到当前反馈位置"""

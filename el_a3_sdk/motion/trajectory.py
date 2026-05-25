@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-logger = logging.getLogger("el_a3_sdk.trajectory")
+logger = logging.getLogger("el_a3_sdk.motion.trajectory")
 
 
 @dataclass

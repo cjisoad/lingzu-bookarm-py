@@ -46,8 +46,8 @@
 └──────────────────────┬───────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────┐
-│            RobstrideCanDriver (SocketCAN)              │
-│            CAN 2.0 Extended Frame · 29-bit ID · 1Mbps │
+│        drivers.create_can_driver()                    │
+│        SocketCAN / SLCAN · CAN 2.0 Extended Frames   │
 └──────────────────────┬───────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────┐
@@ -405,12 +405,12 @@ el_a3_sdk/
 ├── __init__.py          # Package entry
 ├── interface.py         # ELA3Interface — main interface + control loop
 ├── arm_manager.py       # ArmManager — multi-arm manager
-├── can_driver.py        # SocketCAN low-level driver
+├── drivers/             # SocketCAN / SLCAN driver package
 ├── protocol.py          # Protocol enums, motor params, joint config
 ├── data_types.py        # Data structures (SI units)
 ├── kinematics.py        # Pinocchio FK/IK/Jacobian/Gravity
 ├── realsense/           # RealSense RGB-D capture, point cloud, and picking tools
-├── trajectory.py        # S-curve + cubic spline trajectory planning
+├── motion/              # S-curve, cubic spline, and Cartesian trajectory helpers
 ├── utils.py             # Utility functions
 ├── pyproject.toml       # pip install configuration
 └── demo/

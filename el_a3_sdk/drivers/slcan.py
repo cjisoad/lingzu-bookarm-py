@@ -24,9 +24,10 @@ from el_a3_sdk.protocol import (
 from el_a3_sdk.data_types import (
     MotorFeedback, ParamReadResult, FirmwareVersion,
 )
+from el_a3_sdk.drivers.timing import busy_wait_us
 from el_a3_sdk.utils import float_to_uint16, uint16_to_float
 
-logger = logging.getLogger("el_a3_sdk.slcan_driver")
+logger = logging.getLogger("el_a3_sdk.drivers.slcan")
 
 CAN_EFF_MASK = 0x1FFFFFFF
 
@@ -41,15 +42,6 @@ SLCAN_BITRATE_MAP = {
     800000: b"S7",
     1000000: b"S8",
 }
-
-
-def _busy_wait_us(us: int):
-    """微秒级忙等待"""
-    target = time.perf_counter() + us * 1e-6
-    while time.perf_counter() < target:
-        pass
-
-
 class SlcanCanDriver:
     """
     Robstride 电机 SLCAN 底层驱动 (Windows / 跨平台)
@@ -369,11 +361,11 @@ class SlcanCanDriver:
                     self._tx_ok_window_count += 1
                     return True
                 except serial.SerialTimeoutException:
-                    _busy_wait_us(200 << attempt)
+                    busy_wait_us(200 << attempt)
                     continue
                 except Exception as e:
                     if attempt < retries - 1:
-                        _busy_wait_us(200 << attempt)
+                        busy_wait_us(200 << attempt)
                         continue
                     logger.error("SLCAN 发送帧失败 [%s]: %s", self.serial_port, e)
                     self._tx_fail_count += 1

@@ -76,17 +76,10 @@ def get_kinematics():
     return ELA3Kinematics
 
 
-def get_slcan_driver():
-    """延迟导入 SlcanCanDriver（避免无 pyserial 环境下 import 失败）"""
-    from el_a3_sdk.slcan_can_driver import SlcanCanDriver
-    return SlcanCanDriver
-
-
 __all__ = [
     "ELA3Interface",
     "ArmManager",
     "get_kinematics",
-    "get_slcan_driver",
     "MotorFeedback",
     "ArmStatus",
     "ArmJointStates",
