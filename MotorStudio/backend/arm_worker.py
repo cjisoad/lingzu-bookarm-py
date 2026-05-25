@@ -206,12 +206,12 @@ class ArmWorker(QThread):
                 except Exception:
                     sdk_root = Path(__file__).resolve().parent.parent.parent
             inertia_path = sdk_root / "resources" / "config" / "inertia_params.yaml"
-            legacy_urdf_path = sdk_root / "resources" / "urdf" / "el_a3_legacy.urdf"
+            default_urdf_path = sdk_root / "resources" / "urdf" / "el_a3.urdf"
             kwargs = dict(can_name=can_name)
             if inertia_path.exists():
                 kwargs["inertia_config_path"] = str(inertia_path)
-            if legacy_urdf_path.exists():
-                kwargs["urdf_path"] = str(legacy_urdf_path)
+            if default_urdf_path.exists():
+                kwargs["urdf_path"] = str(default_urdf_path)
             kwargs["per_joint_kd_min"] = {4: 0.005, 5: 0.005, 6: 0.005, 7: 0.02}
             kwargs["per_joint_kd_max"] = {4: 0.10, 5: 0.05, 6: 0.05, 7: 0.10}
             kwargs["gravity_joint_scale"] = {4: 2.0}

@@ -1,10 +1,19 @@
 # EL-A3 SDK 核心模块说明
 
-本文档面向需要阅读、维护或二次开发 `el_a3_sdk` 的开发者，重点说明 SDK 核心模块的职责边界、数据流、运动控制链路和常用扩展点。SDK 本体不依赖 ROS，主要通过 CAN / SLCAN 与 Robstride 电机通信，并通过 Pinocchio 提供运动学和动力学能力。
+本文档面向需要阅读、维护或二次开发 `el_a3_sdk` 的开发者，重点说明 SDK 核心模块的职责边界、数据流、运动控制链路和常用扩展点。SDK 本体不依赖 ROS，主要通过 SocketCAN / SLCAN 与 Robstride 电机通信，并通过 Pinocchio 提供运动学和动力学能力。
+
+当前版本已经将 CAN 后端和轨迹规划移入独立子包：
+
+```text
+el_a3_sdk/drivers/
+el_a3_sdk/motion/
+```
+
+外部脚本和 GUI 仍然应该优先通过 `ELA3Interface` 调用机械臂能力，不建议直接绕过主接口访问底层 driver。
 
 ## 1. 总体架构
 
-`el_a3_sdk` 可以分为六层：
+`el_a3_sdk` 可以分为六层。当前结构不是“文件越多越好”，而是保持一个清晰的对外入口，并把硬件通信、运动规划、视觉工具等职责收进各自子包。
 
 | 层级 | 主要模块 | 职责 |
 | --- | --- | --- |
@@ -47,6 +56,21 @@ SDK 默认使用 SI 单位：
 | 姿态 | rad |
 | 力矩 | Nm |
 | 时间 | s |
+
+### 1.1 当前结构与后续重构边界
+
+当前核心入口仍然是 `interface.py` 中的 `ELA3Interface`。它是 SDK 的公开门面，负责把上层调用转成控制循环、轨迹规划和 CAN 指令。
+
+如果后续继续整理核心代码，推荐使用一个适中的 `runtime/` 分组，而不是拆出过多零碎模块：
+
+| 建议模块 | 作用 | 可承接现有代码 |
+| --- | --- | --- |
+| `runtime/context.py` | 装配 driver、kinematics、关节映射、TCP 偏移和默认控制参数 | `ELA3Interface.__init__()` 中的依赖创建、`_get_kinematics()`、`_normalize_tcp_offset()` |
+| `runtime/state.py` | 保存连接状态、机械臂状态、目标关节、轨迹队列、运动完成事件等运行时状态 | `_connected`, `_state`, `_target_positions`, `_target_velocities`, `_trajectory`, `_motion_done` 等成员 |
+| `runtime/control.py` | 实现控制循环、JointCtrl、MoveJ、MoveL、EndPoseCtrl、CartesianVelocityCtrl 等运动行为 | `start_control_loop()`, `_control_loop_tick()`, `JointCtrl()`, `MoveJ()`, `MoveL()` |
+| `runtime/safety.py` | 实现状态门禁、限位保护、急停、复位、总线健康检查等安全逻辑 | `EnableArm()`, `DisableArm()`, `EmergencyStop()`, `ResetArm()`，以及控制循环中的限位裁剪 |
+
+这种方式能让 `ELA3Interface` 逐步变薄，同时不会把项目拆得太散。GUI、脚本和外部用户仍只依赖 `ELA3Interface`。
 
 ## 2. 对外入口：`el_a3_sdk/__init__.py`
 
@@ -120,11 +144,10 @@ arm.DisconnectPort()
 | 步骤 | 说明 |
 | --- | --- |
 | 读取目标 | 从 `_target_positions`, `_target_velocities` 或轨迹队列取当前目标 |
-| 平滑处理 | 对目标位置做 EMA 平滑，对速度前馈做移动平均和二阶 EMA |
 | 安全处理 | 进行关节限位检查、限位附近减速、硬限位保护 |
 | 发送控制帧 | 调用底层 driver 的 `send_motion_control()` 发送运控模式 Type 1 帧 |
 
-控制循环运行时，`JointCtrl()` 不会逐帧直接发送 CAN 指令，而是更新 `_target_positions` 和 `_target_velocities`，由后台循环统一发送。这样可以降低上层调用抖动对电机控制的影响。
+控制循环运行时，`JointCtrl()` 不会逐帧直接发送 CAN 指令，而是更新 `_target_positions` 和 `_target_velocities`，由后台循环统一发送。`MoveJ()` / `MoveL()` 生成的轨迹也会在控制循环中按时间采样并执行。这样可以降低上层调用抖动对电机控制的影响。
 
 控制循环未运行时，`JointCtrl()` 会在调用线程中直接给每个电机发送运动控制帧。
 
@@ -219,6 +242,8 @@ ArmEndPose(x=0.3, y=0.0, z=0.2, rx=0.0, ry=0.0, rz=0.0)
 
 位置单位是 m，姿态单位是 rad。
 
+需要注意的是，`MoveL` 的目标默认是 TCP 位姿。如果设置了 TCP 偏移，IK 会先把 TCP 目标换回 URDF 末端 frame，再求解关节角，因此 GUI 中看到的末端目标坐标应与当前 TCP 配置一致。
+
 ### 4.4 `EndPoseCtrl`
 
 `EndPoseCtrl` 是单目标笛卡尔位姿控制，流程更接近：
@@ -296,6 +321,26 @@ from el_a3_sdk.drivers.slcan import SlcanCanDriver
 
 `RobstrideCanDriver` 负责 Linux SocketCAN 通信。
 
+它直接使用 Linux 原生 socket：
+
+```python
+socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+```
+
+这表示：
+
+- `AF_CAN` 选择 CAN 协议族
+- `SOCK_RAW` 使用原始帧收发
+- `CAN_RAW` 通过 SocketCAN 的原始协议层直接操作 CAN 帧
+
+实际帧使用 29 位扩展 ID 和 8 字节数据区，内部格式为：
+
+```python
+CAN_FRAME_FMT = "=IB3x8s"
+```
+
+对应 `can_id + dlc + padding + data[8]`，总计 16 字节。
+
 主要能力：
 
 | 接口 | 说明 |
@@ -315,6 +360,8 @@ from el_a3_sdk.drivers.slcan import SlcanCanDriver
 ### 5.4 SLCAN 驱动：`drivers/slcan.py`
 
 `SlcanCanDriver` 与 `RobstrideCanDriver` 暴露近似相同的方法，但底层通过串口 SLCAN 适配器通信。
+
+它更适合没有原生 SocketCAN 设备、但有 USB 转 CAN 适配器且适配器固件支持 SLCAN ASCII 协议的场景。
 
 典型初始化：
 
@@ -357,6 +404,8 @@ print(joints.to_list())
 pose = arm.GetArmEndPoseMsgs()
 print(pose.x, pose.y, pose.z)
 ```
+
+`data_types.py` 的作用不是单纯“存类型名”，而是统一 SDK 内部的数据出口。CAN 驱动先把原始反馈解析成 `MotorFeedback`，再由 `interface.py` 汇总为 `ArmJointStates`、`ArmStatus`、`ArmEndPose` 等更适合上层使用的对象。
 
 ## 7. 运动学与动力学模块：`kinematics.py`
 
@@ -452,7 +501,7 @@ from el_a3_sdk.motion import MultiJointPlanner
   -> 生成统一时间轴上的 TrajectoryPoint
 ```
 
-轨迹点最终由 `ELA3Interface` 执行。
+轨迹点最终由 `ELA3Interface` 执行。当前 `MoveJ()` 和 `MoveL()` 都会在需要时补齐速度和加速度前馈，再交给控制循环或同步发送逻辑。
 
 ## 9. 多臂管理：`arm_manager.py`
 
