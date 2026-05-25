@@ -113,9 +113,10 @@ sudo ./scripts/setup_can.sh can0 1000000
 cd el_a3_sdk
 pip install -e .              # basic install
 pip install -e ".[dynamics]"  # with Pinocchio dynamics support
+pip install -e ".[camera]"    # with RealSense point cloud visualization/picking support
 ```
 
-Dependencies: `numpy`, `pyyaml`. Optional: `pinocchio` (`pip install pin`) for FK/IK/gravity compensation.
+Dependencies: `numpy`, `pyyaml`. Optional: `pinocchio` (`pip install pin`) for FK/IK/gravity compensation; `pyrealsense2`, `open3d`, and `opencv-python` for RealSense point cloud visualization/picking.
 
 ### 3. Install Debugger GUI (Optional)
 
@@ -408,9 +409,10 @@ el_a3_sdk/
 ├── protocol.py          # Protocol enums, motor params, joint config
 ├── data_types.py        # Data structures (SI units)
 ├── kinematics.py        # Pinocchio FK/IK/Jacobian/Gravity
+├── realsense/           # RealSense RGB-D capture, point cloud, and picking tools
 ├── trajectory.py        # S-curve + cubic spline trajectory planning
 ├── utils.py             # Utility functions
-├── setup.py             # pip install configuration
+├── pyproject.toml       # pip install configuration
 └── demo/
     ├── control_loop_demo.py   # Control loop demo
     ├── motion_control.py      # Joint motion demo

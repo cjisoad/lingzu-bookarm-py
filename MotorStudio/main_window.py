@@ -3,8 +3,8 @@
 import time
 import logging
 from PyQt6.QtWidgets import (
-    QMainWindow, QDockWidget, QTabWidget,
-    QWidget, QVBoxLayout, QTextEdit, QApplication,
+    QMainWindow, QDockWidget, QTabWidget, QStackedWidget,
+    QWidget, QTextEdit,
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -18,6 +18,7 @@ from MotorStudio.widgets.teaching_panel import TeachingPanel
 from MotorStudio.widgets.diagnostics_panel import DiagnosticsPanel
 from MotorStudio.widgets.gripper_panel import GripperPanel
 from MotorStudio.widgets.gamepad_panel import GamepadPanel
+from MotorStudio.widgets.realsense_point_panel import RealSensePointPanel
 from MotorStudio.widgets.viewer_3d import Viewer3DPanel
 from MotorStudio.utils.i18n import tr
 from MotorStudio.utils.theme_manager import ThemeManager
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         tm.theme_changed.connect(lambda _: self.gripper_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.gamepad_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.tcp_panel.retranslate_ui())
+        tm.theme_changed.connect(lambda _: self.point_cloud_panel.apply_theme())
 
         QTimer.singleShot(500, self._init_3d_model)
         if self._sim_mode:
@@ -79,13 +81,15 @@ class MainWindow(QMainWindow):
         self.toolbar_dock.setStyleSheet("QDockWidget { border: none; }")
         self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.toolbar_dock)
 
-        # --- 左侧：3D 可视化 ---
+        # --- 左侧：3D 可视化 / 点云视图 ---
+        self.left_stack = QStackedWidget()
         self.viewer_3d = Viewer3DPanel(
             urdf_path=self._urdf_path,
             mesh_dir=self._mesh_dir,
         )
+        self.left_stack.addWidget(self.viewer_3d)
         self.viewer_dock = QDockWidget(tr("win.viewer"), self)
-        self.viewer_dock.setWidget(self.viewer_3d)
+        self.viewer_dock.setWidget(self.left_stack)
         self.viewer_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         _hide = QWidget(); _hide.setFixedHeight(0)
         self.viewer_dock.setTitleBarWidget(_hide)
@@ -102,6 +106,11 @@ class MainWindow(QMainWindow):
 
         self.tcp_panel = TcpPanel()
         self.tabs.addTab(self.tcp_panel, tr("tab.tcp"))
+
+        self.point_cloud_panel = RealSensePointPanel()
+        self.tabs.addTab(self.point_cloud_panel, tr("tab.point_cloud"))
+        self.point_cloud_viewer = self.point_cloud_panel.viewer_widget()
+        self.left_stack.addWidget(self.point_cloud_viewer)
 
         self.teaching_panel = TeachingPanel()
         self.tabs.addTab(self.teaching_panel, tr("tab.teaching"))
@@ -139,6 +148,9 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(tr("win.ready"))
 
+        self._point_cloud_tab_index = self.tabs.indexOf(self.point_cloud_panel)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._sync_left_view_for_tab(self.tabs.currentIndex())
         QTimer.singleShot(0, lambda: self._adjust_dock_sizes(self.viewer_dock, self.tabs_dock))
 
     def _connect_signals(self):
@@ -156,6 +168,7 @@ class MainWindow(QMainWindow):
         self.worker.enabled_changed.connect(tb.set_enabled)
         self.worker.enabled_changed.connect(self.joint_panel.set_enabled)
         self.worker.enabled_changed.connect(self.viewer_3d.set_enabled)
+        self.worker.enabled_changed.connect(self.point_cloud_panel.set_arm_enabled)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.log_message.connect(self._append_log)
         self.worker.can_fps_updated.connect(tb.set_fps)
@@ -164,6 +177,7 @@ class MainWindow(QMainWindow):
         self.worker.joints_updated.connect(self._on_joints_updated)
         self.worker.efforts_updated.connect(self._on_efforts_updated)
         self.worker.end_pose_updated.connect(self.trajectory_panel.update_current_end_pose)
+        self.worker.end_pose_updated.connect(self.point_cloud_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.viewer_3d.update_tcp_point)
         self.worker.tcp_offset_updated.connect(self.tcp_panel.set_tcp_offset)
         self.worker.motor_feedback_updated.connect(
@@ -189,12 +203,25 @@ class MainWindow(QMainWindow):
         tcp.tcp_apply_requested.connect(
             lambda offset: self.worker.submit_command("set_tcp_offset", offset)
         )
+        tcp.tcp_apply_requested.connect(self.point_cloud_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(
             lambda offset: self.worker.submit_command("save_tcp_offset", offset)
         )
+        tcp.tcp_save_requested.connect(self.point_cloud_panel.set_tcp_offset)
         tcp.tcp_restore_requested.connect(
             lambda: self.worker.submit_command("restore_tcp_offset")
         )
+        tcp.tcp_restore_requested.connect(
+            lambda: self.point_cloud_panel.set_tcp_offset([0.0] * 6)
+        )
+        self.worker.tcp_offset_updated.connect(self.point_cloud_panel.set_tcp_offset)
+
+        pc = self.point_cloud_panel
+        pc.move_l_requested.connect(
+            lambda pose, dur: self.worker.submit_command("move_l", pose, dur)
+        )
+        pc.log_message.connect(self._append_log)
+        pc.error_occurred.connect(self._on_error)
 
         teach = self.teaching_panel
         teach.zero_torque_requested.connect(
@@ -264,7 +291,7 @@ class MainWindow(QMainWindow):
     def _retranslate_ui(self):
         self.setWindowTitle(tr("win.title"))
         self.toolbar_dock.setWindowTitle(tr("win.toolbar"))
-        self.viewer_dock.setWindowTitle(tr("win.viewer"))
+        self._sync_left_view_for_tab(self.tabs.currentIndex())
         self.tabs_dock.setWindowTitle(tr("win.panels"))
         self.log_dock.setWindowTitle(tr("win.log"))
         self.statusBar().showMessage(tr("win.ready"))
@@ -272,23 +299,25 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(0, tr("tab.joint"))
         self.tabs.setTabText(1, tr("tab.trajectory"))
         self.tabs.setTabText(2, tr("tab.tcp"))
-        self.tabs.setTabText(3, tr("tab.teaching"))
-        self.tabs.setTabText(4, tr("tab.diagnostics"))
-        self.tabs.setTabText(5, tr("tab.gripper"))
-        self.tabs.setTabText(6, tr("tab.gamepad"))
+        self.tabs.setTabText(3, tr("tab.point_cloud"))
+        self.tabs.setTabText(4, tr("tab.teaching"))
+        self.tabs.setTabText(5, tr("tab.diagnostics"))
+        self.tabs.setTabText(6, tr("tab.gripper"))
+        self.tabs.setTabText(7, tr("tab.gamepad"))
 
         for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
-                      self.tcp_panel, self.teaching_panel, self.diagnostics_panel,
-                      self.gripper_panel, self.gamepad_panel, self.viewer_3d):
+                      self.tcp_panel, self.point_cloud_panel, self.teaching_panel,
+                      self.diagnostics_panel, self.gripper_panel,
+                      self.gamepad_panel, self.viewer_3d):
             if hasattr(panel, "retranslate_ui"):
                 panel.retranslate_ui()
         self.monitoring_window.retranslate_ui()
 
     # ---- helpers ----
 
-    def _adjust_dock_sizes(self, viewer_dock, tabs_dock):
+    def _adjust_dock_sizes(self, viewer_dock, tabs_dock, left_ratio=0.60):
         w = self.width()
-        left_w = int(w * 0.50)
+        left_w = int(w * left_ratio)
         right_w = w - left_w
         self.resizeDocks(
             [viewer_dock, tabs_dock], [left_w, right_w], Qt.Orientation.Horizontal
@@ -311,6 +340,35 @@ class MainWindow(QMainWindow):
 
     def _on_connect(self, can_name: str, connect_kwargs: dict):
         self.worker.submit_command("connect", can_name, **connect_kwargs)
+
+    def _on_tab_changed(self, index: int):
+        self._sync_left_view_for_tab(index)
+
+    def _sync_left_view_for_tab(self, index: int):
+        if index == getattr(self, "_point_cloud_tab_index", -1):
+            self.left_stack.setCurrentWidget(self.point_cloud_viewer)
+            self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
+            self.point_cloud_panel.show_viewer()
+            QTimer.singleShot(
+                0,
+                lambda: self._adjust_dock_sizes(
+                    self.viewer_dock,
+                    self.tabs_dock,
+                    left_ratio=0.68,
+                ),
+            )
+            return
+        self.left_stack.setCurrentWidget(self.viewer_3d)
+        self.viewer_dock.setWindowTitle(tr("win.viewer"))
+        self.point_cloud_panel.hide_viewer()
+        QTimer.singleShot(
+            0,
+            lambda: self._adjust_dock_sizes(
+                self.viewer_dock,
+                self.tabs_dock,
+                left_ratio=0.60,
+            ),
+        )
 
     def _start_sim_mode(self):
         self.worker.submit_command("connect", "sim", sim_mode=True)
@@ -362,6 +420,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._append_log(tr("win.closing"))
         self.gamepad_panel.cleanup()
+        self.point_cloud_panel.cleanup()
         if self.monitoring_window.isVisible():
             self.monitoring_window.close()
         if self.worker.is_connected:

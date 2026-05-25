@@ -24,6 +24,9 @@ cd el_a3_sdk
 pip install matplotlib pillow tqdm python-dateutil
 pip install -e .
 
+# 如需 RealSense 点云可视化/选点
+pip install -e ".[camera]"
+
 # 如需运动学/动力学功能
 pip install -e ".[dynamics]"
 
@@ -58,7 +61,8 @@ el-a3-debugger
 | `docs/` | SDK API 协议文档 |
 | `resources/` | URDF、Meshes、惯性参数配置 |
 | `scripts/` | CAN 配置、测试脚本 |
-| `setup.py` | pip 安装配置 |
+| `scripts/camera_test/` | RealSense 点云可视化与选点脚本 |
+| `pyproject.toml` | pip 安装配置 |
 
 ---
 

@@ -1,4 +1,7 @@
-"""EL-A3 机械臂调试上位机 - 入口"""
+"""EL-A3 机械臂调试上位机 - 入口
+启动代码：
+    conda run --no-capture-output -n lingarm python -m MotorStudio.main
+"""
 
 import sys
 import os

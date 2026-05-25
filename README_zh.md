@@ -110,9 +110,10 @@ sudo ./scripts/setup_can.sh can0 1000000
 cd el_a3_sdk
 pip install -e .              # 基本安装
 pip install -e ".[dynamics]"  # 含 Pinocchio 动力学支持
+pip install -e ".[camera]"    # 含 RealSense 点云可视化/选点支持
 ```
 
-依赖：`numpy`、`pyyaml`。可选：`pinocchio` (`pip install pin`) 用于 FK/IK/重力补偿。
+依赖：`numpy`、`pyyaml`。可选：`pinocchio` (`pip install pin`) 用于 FK/IK/重力补偿；`pyrealsense2`、`open3d`、`opencv-python` 用于 RealSense 点云可视化/选点。
 
 ### 3. 安装 Debugger 上位机（可选）
 
@@ -407,9 +408,10 @@ el_a3_sdk/
 ├── protocol.py          # 协议枚举、电机参数、关节配置
 ├── data_types.py        # 数据结构 (SI 单位)
 ├── kinematics.py        # Pinocchio FK/IK/Jacobian/Gravity
+├── realsense/           # RealSense RGB-D 采集、点云和选点工具
 ├── trajectory.py        # S-curve + 三次样条轨迹规划
 ├── utils.py             # 工具函数
-├── setup.py             # pip 安装配置
+├── pyproject.toml       # pip 安装配置
 └── demo/
     ├── control_loop_demo.py   # 控制循环示例
     ├── motion_control.py      # 关节运动示例
