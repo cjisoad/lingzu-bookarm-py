@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -36,10 +36,11 @@ class BookSpineMatchConfig:
     min_inliers: int = 8
     sift_ratio_test: float = 0.72
     sift_features: int = 4000
-    orb_ratio_test: float = 0.82
-    orb_features: int = 3000
-    use_orb: bool = True
-    use_sift: bool = True
+    acquire_match_confidence: float = 0.50
+    acquire_min_good_matches: int = 8
+    acquire_min_inliers: int = 5
+    acquire_tile_columns: int = 3
+    acquire_tile_overlap_ratio: float = 0.20
     search_scales: Tuple[float, ...] = (1.0, 1.5, 2.0)
     max_scaled_frame_side: int = 1800
     use_clahe: bool = True
@@ -48,6 +49,15 @@ class BookSpineMatchConfig:
     roi_expand_ratio: float = 0.45
     roi_min_pad: int = 60
     roi_reacquire_after_misses: int = 3
+    polygon_hold_frames: int = 4
+    min_polygon_area_ratio: float = 0.0002
+    max_polygon_area_ratio: float = 0.75
+    min_polygon_fill_ratio: float = 0.35
+    max_polygon_skew_ratio: float = 3.0
+    max_polygon_jump_ratio: float = 0.25
+    max_polygon_area_change_ratio: float = 0.75
+    polygon_smoothing_alpha: float = 0.25
+    keep_last_good_on_reject: bool = True
     center_smoothing_alpha: float = 0.25
     green_confirm_frames: int = 2
     red_confirm_frames: int = 5
@@ -84,6 +94,16 @@ class BookSpineMatchConfig:
             raise ValueError("min_good_matches must be at least 4.")
         if self.min_inliers < 4:
             raise ValueError("min_inliers must be at least 4.")
+        if not 0.0 <= self.acquire_match_confidence <= 1.0:
+            raise ValueError("acquire_match_confidence must be between 0 and 1.")
+        if self.acquire_min_good_matches < 4:
+            raise ValueError("acquire_min_good_matches must be at least 4.")
+        if self.acquire_min_inliers < 4:
+            raise ValueError("acquire_min_inliers must be at least 4.")
+        if self.acquire_tile_columns < 1:
+            raise ValueError("acquire_tile_columns must be at least 1.")
+        if not 0.0 <= self.acquire_tile_overlap_ratio < 1.0:
+            raise ValueError("acquire_tile_overlap_ratio must be in [0, 1).")
         if not self.search_scales:
             raise ValueError("search_scales must not be empty.")
         if any(scale <= 0.0 for scale in self.search_scales):
@@ -100,6 +120,22 @@ class BookSpineMatchConfig:
             raise ValueError("roi_min_pad must be non-negative.")
         if self.roi_reacquire_after_misses < 1:
             raise ValueError("roi_reacquire_after_misses must be at least 1.")
+        if self.polygon_hold_frames < 0:
+            raise ValueError("polygon_hold_frames must be non-negative.")
+        if self.min_polygon_area_ratio <= 0.0:
+            raise ValueError("min_polygon_area_ratio must be positive.")
+        if self.max_polygon_area_ratio <= self.min_polygon_area_ratio:
+            raise ValueError("max_polygon_area_ratio must be greater than min_polygon_area_ratio.")
+        if not 0.0 < self.min_polygon_fill_ratio <= 1.0:
+            raise ValueError("min_polygon_fill_ratio must be in (0, 1].")
+        if self.max_polygon_skew_ratio < 1.0:
+            raise ValueError("max_polygon_skew_ratio must be at least 1.")
+        if self.max_polygon_jump_ratio <= 0.0:
+            raise ValueError("max_polygon_jump_ratio must be positive.")
+        if not 0.0 <= self.max_polygon_area_change_ratio < 1.0:
+            raise ValueError("max_polygon_area_change_ratio must be in [0, 1).")
+        if not 0.0 < self.polygon_smoothing_alpha <= 1.0:
+            raise ValueError("polygon_smoothing_alpha must be in (0, 1].")
         if not 0.0 < self.center_smoothing_alpha <= 1.0:
             raise ValueError("center_smoothing_alpha must be in (0, 1].")
         if self.green_confirm_frames < 1 or self.red_confirm_frames < 1:
@@ -302,6 +338,111 @@ def polygon_to_roi(
     )
 
 
+def polygon_area(polygon: np.ndarray) -> float:
+    points = polygon.reshape(-1, 2).astype(np.float32)
+    return float(abs(cv2.contourArea(points)))
+
+
+def polygon_bbox_area(polygon: np.ndarray) -> float:
+    points = polygon.reshape(-1, 2).astype(np.float32)
+    if points.size == 0:
+        return 0.0
+    width = float(max(points[:, 0].max() - points[:, 0].min(), 0.0))
+    height = float(max(points[:, 1].max() - points[:, 1].min(), 0.0))
+    return float(width * height)
+
+
+def polygon_fill_ratio(polygon: np.ndarray) -> float:
+    bbox_area = polygon_bbox_area(polygon)
+    if bbox_area <= 0.0:
+        return 0.0
+    return polygon_area(polygon) / bbox_area
+
+
+def polygon_skew_ratio(polygon: np.ndarray) -> float:
+    points = polygon.reshape(-1, 2).astype(np.float32)
+    edges = np.roll(points, -1, axis=0) - points
+    lengths = np.linalg.norm(edges, axis=1)
+    positive = lengths[lengths > 1e-6]
+    if positive.size == 0:
+        return float("inf")
+    return float(positive.max() / max(positive.min(), 1e-6))
+
+
+def polygon_center(polygon: np.ndarray) -> np.ndarray:
+    points = polygon.reshape(-1, 2).astype(np.float32)
+    return np.array([float(points[:, 0].mean()), float(points[:, 1].mean())], dtype=np.float32)
+
+
+def polygon_jump_ratio(
+    current_polygon: np.ndarray,
+    previous_polygon: np.ndarray,
+    frame_shape: Sequence[int],
+) -> float:
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    frame_diagonal = float(max(np.hypot(width, height), 1.0))
+    delta = polygon_center(current_polygon) - polygon_center(previous_polygon)
+    return float(np.linalg.norm(delta) / frame_diagonal)
+
+
+def polygon_area_change_ratio(
+    current_polygon: np.ndarray,
+    previous_polygon: np.ndarray,
+) -> float:
+    current_area = polygon_area(current_polygon)
+    previous_area = polygon_area(previous_polygon)
+    return float(
+        abs(current_area - previous_area) / max(current_area, previous_area, 1.0)
+    )
+
+
+def smooth_polygon(
+    previous_polygon: np.ndarray,
+    current_polygon: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError("alpha must be in (0, 1].")
+    previous_points = np.asarray(previous_polygon, dtype=np.float32).reshape(-1, 2)
+    current_points = np.asarray(current_polygon, dtype=np.float32).reshape(-1, 2)
+    if previous_points.shape != current_points.shape:
+        raise ValueError("polygons must have the same shape.")
+    blended = alpha * current_points + (1.0 - alpha) * previous_points
+    return np.rint(blended).astype(np.int32).reshape(-1, 1, 2)
+
+
+def polygon_is_reasonable(
+    polygon: np.ndarray,
+    frame_shape: Sequence[int],
+    *,
+    min_area_ratio: float,
+    max_area_ratio: float,
+    min_fill_ratio: float,
+    max_skew_ratio: float,
+) -> bool:
+    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+    if points.size == 0 or points.shape[0] < 4:
+        return False
+    if not np.isfinite(points).all():
+        return False
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    frame_area = float(max(width * height, 1))
+    area = polygon_area(points)
+    if area <= 0.0:
+        return False
+    area_ratio = area / frame_area
+    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+        return False
+    fill_ratio = polygon_fill_ratio(points)
+    if fill_ratio < min_fill_ratio:
+        return False
+    if polygon_skew_ratio(points) > max_skew_ratio:
+        return False
+    if not cv2.isContourConvex(points.reshape(-1, 1, 2)):
+        return False
+    return True
+
+
 def evaluate_center_alignment(
     frame_shape: Sequence[int],
     polygon: np.ndarray,
@@ -378,11 +519,19 @@ def build_feature_backends(
         keypoints, descriptors = detector.detectAndCompute(gray, None)
         if descriptors is None or len(keypoints) < config.min_good_matches:
             return
+        matcher: Any
+        if name == "SIFT":
+            index_params = dict(algorithm=1, trees=5)
+            search_params = dict(checks=48)
+            matcher = cv2.FlannBasedMatcher(index_params, search_params)
+            descriptors = np.asarray(descriptors, dtype=np.float32)
+        else:
+            matcher = cv2.BFMatcher(norm_type)
         backends.append(
             FeatureBackend(
                 name=name,
                 detector=detector,
-                matcher=cv2.BFMatcher(norm_type),
+                matcher=matcher,
                 ratio_test=ratio_test,
                 min_good_matches=config.min_good_matches,
                 min_inliers=config.min_inliers,
@@ -392,24 +541,19 @@ def build_feature_backends(
             )
         )
 
-    if config.use_orb:
-        make_backend(
-            "ORB",
-            cv2.ORB_create(nfeatures=config.orb_features),
-            cv2.NORM_HAMMING,
-            config.orb_ratio_test,
-        )
-    if config.use_sift and hasattr(cv2, "SIFT_create"):
-        make_backend(
-            "SIFT",
-            cv2.SIFT_create(nfeatures=config.sift_features),
-            cv2.NORM_L2,
-            config.sift_ratio_test,
-        )
+    if not hasattr(cv2, "SIFT_create"):
+        raise ValueError("Current OpenCV build does not provide SIFT_create.")
+
+    make_backend(
+        "SIFT",
+        cv2.SIFT_create(nfeatures=config.sift_features),
+        cv2.NORM_L2,
+        config.sift_ratio_test,
+    )
 
     if not backends:
         raise ValueError(
-            "Template image has too few features for the enabled matching backends."
+            "Template image has too few SIFT features for matching."
         )
     return backends
 
@@ -420,22 +564,32 @@ def match_target(
     *,
     frame_max_side: int,
     search_rect: Optional[Rect] = None,
+    search_scope: Optional[str] = None,
     scale: float = 1.0,
     use_clahe: bool = True,
     clahe_clip_limit: float = 2.0,
     clahe_tile_grid_size: int = 8,
+    min_good_matches: Optional[int] = None,
+    min_inliers: Optional[int] = None,
 ) -> BookSpineMatchResult:
     if search_rect is None:
         search_frame = frame_bgr
         offset_x = 0
         offset_y = 0
-        search_scope = "FULL"
+        scope_name = "FULL"
     else:
         x0, y0, x1, y1 = search_rect
         search_frame = frame_bgr[y0:y1, x0:x1]
         offset_x = x0
         offset_y = y0
-        search_scope = "ROI"
+        scope_name = "ROI"
+    if search_scope is not None:
+        scope_name = search_scope
+
+    required_good_matches = (
+        backend.min_good_matches if min_good_matches is None else int(min_good_matches)
+    )
+    required_inliers = backend.min_inliers if min_inliers is None else int(min_inliers)
 
     frame_scaled, scale_factor = scale_keep_aspect(search_frame, scale)
     if frame_max_side > 0:
@@ -449,11 +603,14 @@ def match_target(
     )
     frame_keypoints, frame_descriptors = backend.detector.detectAndCompute(gray, None)
 
-    if frame_descriptors is None or len(frame_keypoints) < backend.min_good_matches:
-        return BookSpineMatchResult(None, 0, 0, 0.0, backend.name, search_scope)
+    if frame_descriptors is None or len(frame_keypoints) < required_good_matches:
+        return BookSpineMatchResult(None, 0, 0, 0.0, backend.name, scope_name)
+
+    template_descriptors = np.asarray(backend.template_descriptors, dtype=np.float32)
+    frame_descriptors = np.asarray(frame_descriptors, dtype=np.float32)
 
     raw_matches = backend.matcher.knnMatch(
-        backend.template_descriptors,
+        template_descriptors,
         frame_descriptors,
         k=2,
     )
@@ -465,14 +622,14 @@ def match_target(
         if first.distance < backend.ratio_test * second.distance:
             good_matches.append(first)
 
-    if len(good_matches) < backend.min_good_matches:
+    if len(good_matches) < required_good_matches:
         return BookSpineMatchResult(
             None,
             len(good_matches),
             0,
             0.0,
             backend.name,
-            search_scope,
+            scope_name,
         )
 
     src_pts = np.float32(
@@ -490,19 +647,19 @@ def match_target(
             0,
             0.0,
             backend.name,
-            search_scope,
+            scope_name,
         )
 
     inliers = int(mask.ravel().sum())
     confidence = inliers / max(len(good_matches), 1)
-    if inliers < backend.min_inliers:
+    if inliers < required_inliers:
         return BookSpineMatchResult(
             None,
             len(good_matches),
             inliers,
             confidence,
             backend.name,
-            search_scope,
+            scope_name,
         )
 
     projected = cv2.perspectiveTransform(backend.template_corners, matrix)
@@ -517,7 +674,7 @@ def match_target(
         inliers,
         confidence,
         backend.name,
-        search_scope,
+        scope_name,
     )
 
 
@@ -533,6 +690,12 @@ def match_with_fallback(
     use_clahe: bool = True,
     clahe_clip_limit: float = 2.0,
     clahe_tile_grid_size: int = 8,
+    search_scope: Optional[str] = None,
+    min_good_matches: Optional[int] = None,
+    min_inliers: Optional[int] = None,
+    polygon_validator: Optional[
+        Callable[[np.ndarray, Sequence[int]], bool]
+    ] = None,
 ) -> BookSpineMatchResult:
     best_result: Optional[BookSpineMatchResult] = None
     scales = normalized_search_scales(
@@ -548,16 +711,25 @@ def match_with_fallback(
                 backend,
                 frame_max_side=frame_max_side,
                 search_rect=search_rect,
+                search_scope=search_scope,
                 scale=scale,
                 use_clahe=use_clahe,
                 clahe_clip_limit=clahe_clip_limit,
                 clahe_tile_grid_size=clahe_tile_grid_size,
+                min_good_matches=min_good_matches,
+                min_inliers=min_inliers,
             )
-            result = _replace_result(
-                result,
-                accepted=result.polygon is not None
-                and result.match_confidence >= match_confidence,
-            )
+            polygon_is_valid = True
+            if result.polygon is not None and polygon_validator is not None:
+                polygon_is_valid = bool(polygon_validator(result.polygon, frame_bgr.shape))
+            if result.polygon is not None and not polygon_is_valid:
+                result = _replace_result(result, polygon=None, accepted=False)
+            else:
+                result = _replace_result(
+                    result,
+                    accepted=result.polygon is not None
+                    and result.match_confidence >= match_confidence,
+                )
             if result.accepted:
                 return result
             if best_result is None:
@@ -571,8 +743,8 @@ def match_with_fallback(
                 best_result = result
 
     if best_result is None:
-        search_scope = "ROI" if search_rect is not None else "FULL"
-        return BookSpineMatchResult(None, 0, 0, 0.0, "NONE", search_scope)
+        scope_name = search_scope if search_scope is not None else ("ROI" if search_rect is not None else "FULL")
+        return BookSpineMatchResult(None, 0, 0, 0.0, "NONE", scope_name)
     return best_result
 
 
@@ -622,6 +794,10 @@ class BookSpineMatcher:
             template_image_bgr,
             self.config.template_max_side,
         )[0]
+        template_height, template_width = self.template_image_bgr.shape[:2]
+        self.template_skew_ratio = max(template_width, template_height) / float(
+            max(min(template_width, template_height), 1)
+        )
         self.backends = build_feature_backends(self.template_image_bgr, self.config)
         self.reset_tracking()
 
@@ -638,6 +814,9 @@ class BookSpineMatcher:
         self.roi_rect: Optional[Rect] = None
         self.roi_miss_streak = 0
         self.smoothed_book_center_x: Optional[float] = None
+        self.smoothed_polygon: Optional[np.ndarray] = None
+        self.last_good_result: Optional[BookSpineMatchResult] = None
+        self.polygon_hold_streak = 0
         self.stable_centered = False
         self.green_count = 0
         self.red_count = 0
@@ -647,36 +826,31 @@ class BookSpineMatcher:
             self.roi_rect is not None
             and self.roi_miss_streak < self.config.roi_reacquire_after_misses
         )
-        result = match_with_fallback(
-            frame_bgr,
-            self.backends,
-            frame_max_side=self.config.frame_max_side,
-            search_rect=self.roi_rect if use_roi else None,
-            match_confidence=self.config.match_confidence,
-            search_scales=self.config.search_scales if not use_roi else (1.0,),
-            max_scaled_frame_side=self.config.max_scaled_frame_side,
-            use_clahe=self.config.use_clahe,
-            clahe_clip_limit=self.config.clahe_clip_limit,
-            clahe_tile_grid_size=self.config.clahe_tile_grid_size,
-        )
+        if use_roi:
+            result = match_with_fallback(
+                frame_bgr,
+                self.backends,
+                frame_max_side=self.config.frame_max_side,
+                search_rect=self.roi_rect,
+                match_confidence=self.config.match_confidence,
+                search_scales=(1.0,),
+                max_scaled_frame_side=self.config.max_scaled_frame_side,
+                use_clahe=self.config.use_clahe,
+                clahe_clip_limit=self.config.clahe_clip_limit,
+                clahe_tile_grid_size=self.config.clahe_tile_grid_size,
+                polygon_validator=self._polygon_validator,
+            )
+        else:
+            result = self._acquire_book_spine(frame_bgr)
+        result = self._stabilize_result(result, frame_bgr.shape)
 
         if result.accepted:
             self.roi_miss_streak = 0
         elif use_roi:
             self.roi_miss_streak += 1
             if self.roi_miss_streak >= self.config.roi_reacquire_after_misses:
-                result = match_with_fallback(
-                    frame_bgr,
-                    self.backends,
-                    frame_max_side=self.config.frame_max_side,
-                    search_rect=None,
-                    match_confidence=self.config.match_confidence,
-                    search_scales=self.config.search_scales,
-                    max_scaled_frame_side=self.config.max_scaled_frame_side,
-                    use_clahe=self.config.use_clahe,
-                    clahe_clip_limit=self.config.clahe_clip_limit,
-                    clahe_tile_grid_size=self.config.clahe_tile_grid_size,
-                )
+                result = self._acquire_book_spine(frame_bgr)
+                result = self._stabilize_result(result, frame_bgr.shape)
                 if result.accepted:
                     self.roi_miss_streak = 0
                 else:
@@ -714,8 +888,101 @@ class BookSpineMatcher:
             use_clahe=self.config.use_clahe,
             clahe_clip_limit=self.config.clahe_clip_limit,
             clahe_tile_grid_size=self.config.clahe_tile_grid_size,
+            polygon_validator=self._polygon_validator,
         )
         return self._with_geometry(result, frame_bgr.shape)
+
+    def _acquisition_search_rects(
+        self,
+        frame_shape: Sequence[int],
+    ) -> List[Rect]:
+        height = int(frame_shape[0])
+        width = int(frame_shape[1])
+        tile_columns = max(1, int(self.config.acquire_tile_columns))
+        if tile_columns == 1:
+            return [(0, 0, width, height)]
+
+        overlap = min(max(float(self.config.acquire_tile_overlap_ratio), 0.0), 0.45)
+        step = width / float(tile_columns)
+        pad = max(0, int(round(step * overlap)))
+
+        rects: List[Rect] = []
+        for index in range(tile_columns):
+            left = max(0, int(round(index * step)) - pad)
+            right = min(width, int(round((index + 1) * step)) + pad)
+            if right - left >= 2:
+                rects.append((left, 0, right, height))
+
+        rects.sort(key=lambda rect: abs(((rect[0] + rect[2]) / 2.0) - (width / 2.0)))
+        unique_rects: List[Rect] = []
+        for rect in rects:
+            if rect not in unique_rects:
+                unique_rects.append(rect)
+        return unique_rects
+
+    def _acquire_book_spine(self, frame_bgr: np.ndarray) -> BookSpineMatchResult:
+        best_result: Optional[BookSpineMatchResult] = None
+        frame_shape = frame_bgr.shape
+        for search_rect in self._acquisition_search_rects(frame_shape):
+            result = match_with_fallback(
+                frame_bgr,
+                self.backends,
+                frame_max_side=self.config.frame_max_side,
+                search_rect=search_rect,
+                search_scope="ACQUIRE",
+                match_confidence=self.config.acquire_match_confidence,
+                search_scales=(1.0,),
+                max_scaled_frame_side=self.config.max_scaled_frame_side,
+                use_clahe=self.config.use_clahe,
+                clahe_clip_limit=self.config.clahe_clip_limit,
+                clahe_tile_grid_size=self.config.clahe_tile_grid_size,
+                min_good_matches=self.config.acquire_min_good_matches,
+                min_inliers=self.config.acquire_min_inliers,
+                polygon_validator=self._polygon_validator,
+            )
+            result = self._stabilize_result(result, frame_shape)
+            if result.accepted:
+                return result
+            if best_result is None:
+                best_result = result
+            elif (
+                result.polygon is not None
+                and result.match_confidence > best_result.match_confidence
+            ):
+                best_result = result
+            elif best_result.polygon is None and result.inlier_count > best_result.inlier_count:
+                best_result = result
+
+        fallback_result = match_with_fallback(
+            frame_bgr,
+            self.backends,
+            frame_max_side=self.config.frame_max_side,
+            search_rect=None,
+            search_scope="ACQUIRE",
+            match_confidence=self.config.acquire_match_confidence,
+            search_scales=(1.0,),
+            max_scaled_frame_side=self.config.max_scaled_frame_side,
+            use_clahe=self.config.use_clahe,
+            clahe_clip_limit=self.config.clahe_clip_limit,
+            clahe_tile_grid_size=self.config.clahe_tile_grid_size,
+            min_good_matches=self.config.acquire_min_good_matches,
+            min_inliers=self.config.acquire_min_inliers,
+            polygon_validator=self._polygon_validator,
+        )
+        fallback_result = self._stabilize_result(fallback_result, frame_shape)
+        if fallback_result.accepted:
+            return fallback_result
+        if best_result is None:
+            return fallback_result
+        if best_result.polygon is None and fallback_result.polygon is not None:
+            return fallback_result
+        if (
+            best_result.polygon is not None
+            and fallback_result.polygon is not None
+            and fallback_result.match_confidence > best_result.match_confidence
+        ):
+            return fallback_result
+        return best_result
 
     def _with_tracking_state(
         self,
@@ -790,6 +1057,72 @@ class BookSpineMatcher:
         center = ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
         return _replace_result(result, bbox_xyxy=bbox, center_px=center)
 
+    def _polygon_validator(self, polygon: np.ndarray, frame_shape: Sequence[int]) -> bool:
+        max_skew_ratio = max(
+            self.config.max_polygon_skew_ratio,
+            self.template_skew_ratio * 2.0,
+        )
+        return polygon_is_reasonable(
+            polygon,
+            frame_shape,
+            min_area_ratio=self.config.min_polygon_area_ratio,
+            max_area_ratio=self.config.max_polygon_area_ratio,
+            min_fill_ratio=self.config.min_polygon_fill_ratio,
+            max_skew_ratio=max_skew_ratio,
+        )
+
+    def _stabilize_result(
+        self,
+        result: BookSpineMatchResult,
+        frame_shape: Sequence[int],
+    ) -> BookSpineMatchResult:
+        if result.polygon is not None:
+            current_polygon = np.asarray(result.polygon, dtype=np.float32).reshape(-1, 1, 2)
+            polygon_ok = result.accepted and self._polygon_validator(
+                current_polygon,
+                frame_shape,
+            )
+            if polygon_ok and self.smoothed_polygon is not None:
+                if (
+                    polygon_jump_ratio(current_polygon, self.smoothed_polygon, frame_shape)
+                    > self.config.max_polygon_jump_ratio
+                    or polygon_area_change_ratio(current_polygon, self.smoothed_polygon)
+                    > self.config.max_polygon_area_change_ratio
+                ):
+                    polygon_ok = False
+            if polygon_ok:
+                if self.smoothed_polygon is None:
+                    stabilized_polygon = np.rint(current_polygon).astype(np.int32)
+                else:
+                    stabilized_polygon = smooth_polygon(
+                        self.smoothed_polygon,
+                        current_polygon,
+                        self.config.polygon_smoothing_alpha,
+                    )
+                self.smoothed_polygon = stabilized_polygon.astype(np.float32)
+                self.last_good_result = _replace_result(
+                    result,
+                    polygon=stabilized_polygon,
+                    accepted=True,
+                )
+                self.polygon_hold_streak = 0
+                return self.last_good_result
+
+        if (
+            self.config.keep_last_good_on_reject
+            and self.last_good_result is not None
+            and self.polygon_hold_streak < self.config.polygon_hold_frames
+        ):
+            self.polygon_hold_streak += 1
+            return _replace_result(self.last_good_result, accepted=True)
+
+        self.smoothed_polygon = None
+        self.last_good_result = None
+        self.polygon_hold_streak = 0
+        if result.polygon is not None:
+            return _replace_result(result, polygon=None, accepted=False)
+        return result
+
     def _with_alignment(
         self,
         result: BookSpineMatchResult,
@@ -827,7 +1160,7 @@ def draw_book_spine_overlay(
     display = frame_bgr.copy()
     status_color = (0, 255, 0) if result.stable_centered else (0, 0, 255)
 
-    if result.polygon is not None:
+    if result.accepted and result.polygon is not None:
         cv2.polylines(display, [result.polygon], True, status_color, 3, cv2.LINE_AA)
 
     if result.polygon is None:

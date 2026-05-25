@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    python scripts/camera_test/realsense_book_spine_demo.py --template /home/boreas/project/lingzu_arm/EDULITE_A3/el_a3_sdk/assets/book_photos/net2.jpeg
+    python scripts/camera_test/realsense_book_spine_demo.py --template /home/boreas/project/lingzu_arm/EDULITE_A3/el_a3_sdk/assets/book_photos/net2.png
 """
 
 from __future__ import annotations
@@ -57,8 +57,6 @@ def parse_args() -> argparse.Namespace:
     matcher.add_argument("--search-scales", default=None, help="搜索尺度，逗号分隔，例如 1,1.5,2。")
     matcher.add_argument("--max-scaled-frame-side", type=int, default=None, help="多尺度放大后的最大边；0 表示不限制。")
     matcher.add_argument("--disable-clahe", action="store_true", help="禁用灰度对比增强。")
-    matcher.add_argument("--disable-orb", action="store_true", help="禁用 ORB 后端。")
-    matcher.add_argument("--disable-sift", action="store_true", help="禁用 SIFT 后端。")
 
     output = parser.add_argument_group("output")
     output.add_argument("--window-name", default="RealSense Book Spine", help="OpenCV 窗口名称。")
@@ -94,10 +92,6 @@ def load_config(args: argparse.Namespace) -> BookSpineMatchConfig:
         values["max_scaled_frame_side"] = args.max_scaled_frame_side
     if args.disable_clahe:
         values["use_clahe"] = False
-    if args.disable_orb:
-        values["use_orb"] = False
-    if args.disable_sift:
-        values["use_sift"] = False
     config = BookSpineMatchConfig.from_mapping(values)
     config.validate()
     return config

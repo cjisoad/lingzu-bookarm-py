@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import List, Sequence
 
 
-DEFAULT_TCP_OFFSET = [0.0] * 6
+# Internal SDK order maps to MotorStudio UI as X=offset[2], Y=offset[0], Z=offset[1].
+DEFAULT_TCP_OFFSET = [0.0, 0.05, -0.14, 0.0, 0.0, 0.0]
+LEGACY_ZERO_TCP_OFFSET = [0.0] * 6
+CONFIG_VERSION = 2
 
 
 def _config_dir() -> Path:
@@ -42,6 +45,10 @@ def normalize_tcp_offset(values: Sequence[float] | None) -> List[float]:
     return offset
 
 
+def _is_same_offset(left: Sequence[float], right: Sequence[float]) -> bool:
+    return all(abs(float(a) - float(b)) < 1e-12 for a, b in zip(left, right))
+
+
 def load_tcp_offset(default: Sequence[float] | None = None) -> List[float]:
     path = get_tcp_offset_path()
     fallback = normalize_tcp_offset(default)
@@ -57,14 +64,24 @@ def load_tcp_offset(default: Sequence[float] | None = None) -> List[float]:
     values = payload
     if isinstance(payload, dict):
         values = payload.get("tcp_offset", payload.get("offset", fallback))
-    return normalize_tcp_offset(values)
+    normalized = normalize_tcp_offset(values)
+    if (
+        default is None
+        and isinstance(payload, dict)
+        and "version" not in payload
+        and _is_same_offset(normalized, LEGACY_ZERO_TCP_OFFSET)
+    ):
+        return fallback
+    return normalized
 
 
 def save_tcp_offset(offset: Sequence[float]) -> Path:
     path = get_tcp_offset_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"tcp_offset": normalize_tcp_offset(offset)}
+    payload = {
+        "version": CONFIG_VERSION,
+        "tcp_offset": normalize_tcp_offset(offset),
+    }
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return path
-

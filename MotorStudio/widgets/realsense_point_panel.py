@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import json
+from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -51,19 +53,92 @@ M_TO_CM = 100.0
 
 
 # Camera -> robot base extrinsic:
-# camera +X -> robot -Y
+# camera +X -> robot +Y
 # camera +Y -> robot -Z
 # camera +Z -> robot -X
-# camera origin in robot base: x=+5 cm, y=-28 cm, z=+13.5 cm.
-CAMERA_TO_ROBOT_ROTATION = np.array(
+# camera origin in robot base: x=+5 cm, y=-28.5 cm, z=+15 cm.
+CAMERA_TO_ROBOT_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "resources"
+    / "config"
+    / "camera_to_robot_transform.json"
+)
+DEFAULT_CAMERA_TO_ROBOT_MATRIX = np.array(
     [
-        [0.0, 0.0, -1.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0, 0.05],
+        [1.0, 0.0, 0.0, -0.285],
+        [0.0, -1.0, 0.0, 0.15],
+        [0.0, 0.0, 0.0, 1.0],
     ],
     dtype=float,
 )
-CAMERA_TO_ROBOT_TRANSLATION_M = np.array([0.05, -0.28, 0.135], dtype=float)
+
+
+def _validated_array(values, shape: tuple[int, ...], name: str) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    if array.shape != shape:
+        raise ValueError(f"{name} shape must be {shape}, got {array.shape}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain finite numbers")
+    return array
+
+
+def _load_camera_to_robot_transform(
+    path: Path = CAMERA_TO_ROBOT_CONFIG_PATH,
+) -> np.ndarray:
+    """Load camera->robot extrinsic from JSON, falling back to built-in values."""
+
+    matrix = DEFAULT_CAMERA_TO_ROBOT_MATRIX.copy()
+    if not path.exists():
+        return matrix
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+        if not isinstance(payload, dict):
+            raise ValueError("JSON root must be an object")
+
+        if "matrix" in payload:
+            matrix = _validated_array(payload["matrix"], (4, 4), "matrix")
+        else:
+            rotation_values = payload.get(
+                "rotation",
+                payload.get("rotation_matrix", matrix[:3, :3]),
+            )
+            rotation = _validated_array(rotation_values, (3, 3), "rotation")
+
+            translation = matrix[:3, 3]
+            if "translation_m" in payload:
+                translation = _validated_array(
+                    payload["translation_m"],
+                    (3,),
+                    "translation_m",
+                )
+            elif "translation_cm" in payload:
+                translation = (
+                    _validated_array(payload["translation_cm"], (3,), "translation_cm")
+                    / M_TO_CM
+                )
+            elif "xyz_m" in payload:
+                translation = _validated_array(payload["xyz_m"], (3,), "xyz_m")
+
+            matrix = np.eye(4, dtype=float)
+            matrix[:3, :3] = rotation
+            matrix[:3, 3] = translation
+
+        return matrix.astype(float, copy=True)
+    except Exception as exc:
+        logger.warning(
+            "加载相机到机械臂外参失败，使用内置默认值: %s (%s)",
+            path,
+            exc,
+        )
+        return matrix
+
+
+CAMERA_TO_ROBOT_MATRIX = _load_camera_to_robot_transform()
+CAMERA_TO_ROBOT_ROTATION = CAMERA_TO_ROBOT_MATRIX[:3, :3]
+CAMERA_TO_ROBOT_TRANSLATION_M = CAMERA_TO_ROBOT_MATRIX[:3, 3]
 
 
 def _rpy_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
@@ -103,7 +178,9 @@ def camera_point_to_robot_target(
     """Map a RealSense camera-space point into robot base coordinates."""
 
     camera_point = np.asarray(camera_point_m, dtype=float).reshape(3)
-    return CAMERA_TO_ROBOT_ROTATION @ camera_point + CAMERA_TO_ROBOT_TRANSLATION_M
+    camera_point_h = np.ones(4, dtype=float)
+    camera_point_h[:3] = camera_point
+    return (CAMERA_TO_ROBOT_MATRIX @ camera_point_h)[:3]
 
 
 def apply_tcp_offset_correction(
@@ -449,6 +526,13 @@ class RealSensePointPanel(QWidget):
         layout = QFormLayout(self.result_group)
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        self.pixel_label = QLabel(tr("pc.pixel"))
+        self.camera_point_label = QLabel(tr("pc.camera_point"))
+        self.robot_point_cm_label = QLabel(tr("pc.move_target_point_cm"))
+        self.robot_point_m_label = QLabel(tr("pc.move_target_point_m"))
+        self.target_point_cm_label = QLabel(tr("pc.target_point_cm"))
+        self.target_point_m_label = QLabel(tr("pc.target_point_m"))
+
         self.pixel_value = QLabel("--")
         self.camera_point_value = QLabel("--")
         self.move_target_point_cm_value = QLabel("--")
@@ -456,12 +540,12 @@ class RealSensePointPanel(QWidget):
         self.target_point_cm_value = QLabel("--")
         self.target_point_m_value = QLabel("--")
 
-        layout.addRow(QLabel(tr("pc.pixel")), self.pixel_value)
-        layout.addRow(QLabel(tr("pc.camera_point")), self.camera_point_value)
-        layout.addRow(QLabel(tr("pc.move_target_point_cm")), self.move_target_point_cm_value)
-        layout.addRow(QLabel(tr("pc.move_target_point_m")), self.move_target_point_m_value)
-        layout.addRow(QLabel(tr("pc.target_point_cm")), self.target_point_cm_value)
-        layout.addRow(QLabel(tr("pc.target_point_m")), self.target_point_m_value)
+        layout.addRow(self.pixel_label, self.pixel_value)
+        layout.addRow(self.camera_point_label, self.camera_point_value)
+        layout.addRow(self.robot_point_cm_label, self.move_target_point_cm_value)
+        layout.addRow(self.robot_point_m_label, self.move_target_point_m_value)
+        layout.addRow(self.target_point_cm_label, self.target_point_cm_value)
+        layout.addRow(self.target_point_m_label, self.target_point_m_value)
         return self.result_group
 
     def _create_move_group(self):
@@ -928,11 +1012,17 @@ class RealSensePointPanel(QWidget):
     def _update_transform_summary(self):
         if not hasattr(self, "transform_summary"):
             return
+        matrix_text = np.array2string(
+            CAMERA_TO_ROBOT_MATRIX,
+            precision=3,
+            suppress_small=True,
+            separator=", ",
+        )
         self.transform_summary.setText(
             tr(
                 "pc.transform_summary",
-                rotation="+X->-Y, +Y->-Z, +Z->-X",
-                translation="+5.0 cm, -28.0 cm, +13.5 cm",
+                path=str(CAMERA_TO_ROBOT_CONFIG_PATH),
+                matrix=matrix_text,
             )
         )
 
@@ -1101,6 +1191,12 @@ class RealSensePointPanel(QWidget):
         self._update_transform_summary()
 
         self.result_group.setTitle(tr("pc.result_group"))
+        self.pixel_label.setText(tr("pc.pixel"))
+        self.camera_point_label.setText(tr("pc.camera_point"))
+        self.robot_point_cm_label.setText(tr("pc.move_target_point_cm"))
+        self.robot_point_m_label.setText(tr("pc.move_target_point_m"))
+        self.target_point_cm_label.setText(tr("pc.target_point_cm"))
+        self.target_point_m_label.setText(tr("pc.target_point_m"))
         self.move_group.setTitle(tr("pc.move_group"))
         for label, key in zip(self.rpy_labels, ("pc.rx", "pc.ry", "pc.rz")):
             label.setText(tr(key))

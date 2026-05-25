@@ -13,6 +13,7 @@ from el_a3_sdk.realsense.book_spine_matcher import (
     BookSpineMatchResult,
     draw_book_spine_overlay,
     evaluate_center_alignment,
+    polygon_is_reasonable,
     polygon_to_bbox,
     polygon_to_roi,
     resize_keep_aspect,
@@ -69,6 +70,18 @@ def test_geometry_helpers():
     assert roi[1] <= bbox[1]
     assert roi[2] >= bbox[2]
     assert roi[3] >= bbox[3]
+
+
+def test_polygon_reasonable_filters_irregular_shape():
+    polygon = np.array([[[100, 100]], [[500, 100]], [[500, 110]], [[100, 105]]], dtype=np.int32)
+    assert not polygon_is_reasonable(
+        polygon,
+        (720, 1280, 3),
+        min_area_ratio=0.0002,
+        max_area_ratio=0.75,
+        min_fill_ratio=0.35,
+        max_skew_ratio=3.0,
+    )
 
 
 def test_center_alignment_and_state():
@@ -142,6 +155,56 @@ def test_book_spine_matcher_finds_synthetic_template():
     result_dict = result.to_dict()
     assert result_dict["found"] is True
     assert result_dict["polygon"] is not None
+
+
+def test_book_spine_matcher_holds_last_good_polygon_on_reject():
+    template = make_template()
+    matcher = BookSpineMatcher(
+        template,
+        BookSpineMatchConfig(
+            match_confidence=0.05,
+            center_tolerance_ratio=0.5,
+            min_center_tolerance_px=10,
+            frame_max_side=0,
+            template_max_side=1200,
+            min_good_matches=8,
+            min_inliers=6,
+            roi_reacquire_after_misses=2,
+            green_confirm_frames=1,
+            red_confirm_frames=1,
+            polygon_hold_frames=2,
+        ),
+    )
+
+    frame_shape = (720, 1280, 3)
+    good_polygon = np.array([[[300, 100]], [[500, 100]], [[500, 500]], [[300, 500]]], dtype=np.int32)
+    good_result = BookSpineMatchResult(
+        good_polygon,
+        16,
+        12,
+        0.9,
+        "SIFT",
+        "FULL",
+        accepted=True,
+    )
+    stabilized = matcher._stabilize_result(good_result, frame_shape)
+    assert stabilized.accepted
+    assert stabilized.polygon is not None
+
+    bad_polygon = np.array([[[100, 100]], [[500, 100]], [[500, 110]], [[100, 105]]], dtype=np.int32)
+    bad_result = BookSpineMatchResult(
+        bad_polygon,
+        18,
+        14,
+        0.95,
+        "SIFT",
+        "FULL",
+        accepted=True,
+    )
+    held = matcher._stabilize_result(bad_result, frame_shape)
+    assert held.accepted
+    assert held.polygon is not None
+    assert np.array_equal(held.polygon, stabilized.polygon)
 
 
 def test_book_spine_matcher_finds_smaller_template_in_frame():
