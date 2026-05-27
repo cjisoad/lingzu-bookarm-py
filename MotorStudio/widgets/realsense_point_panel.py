@@ -11,8 +11,10 @@ from typing import Optional, Sequence
 import numpy as np
 
 from PyQt6.QtCore import QEvent, QSignalBlocker, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
@@ -20,6 +22,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -30,6 +33,11 @@ from PyQt6.QtWidgets import (
 from MotorStudio.utils.i18n import tr
 from MotorStudio.utils.style import SCENE_COLORS
 from MotorStudio.utils.theme_manager import ThemeManager
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 try:
     import pyvista as pv
@@ -50,6 +58,15 @@ except Exception as _exc:
 logger = logging.getLogger("MotorStudio.realsense_panel")
 
 M_TO_CM = 100.0
+DEFAULT_BOOK_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[2] / "assets" / "book_photos" / "net2.png"
+)
+BOOK_TEMPLATE_OPTIONS = [
+    ("net2.png", Path(__file__).resolve().parents[2] / "assets" / "book_photos" / "net2.png"),
+    ("test2.jpeg", Path(__file__).resolve().parents[2] / "pic" / "test2.jpeg"),
+    ("test3.jpeg", Path(__file__).resolve().parents[2] / "pic" / "test3.jpeg"),
+    ("test4.jpeg", Path(__file__).resolve().parents[2] / "pic" / "test4.jpeg"),
+]
 
 
 # Camera -> robot base extrinsic:
@@ -213,6 +230,17 @@ def _format_vec_cm(values: Sequence[float]) -> str:
     return f"X={vals[0]:.2f} cm, Y={vals[1]:.2f} cm, Z={vals[2]:.2f} cm"
 
 
+def _book_pick_point_from_polygon(polygon: np.ndarray) -> tuple[int, int]:
+    points = np.asarray(polygon, dtype=float).reshape(-1, 2)
+    if len(points) < 4:
+        raise ValueError("书脊识别结果缺少四边形角点。")
+    tl, tr, br, bl = points[:4]
+    left = tl * (5.0 / 6.0) + bl * (1.0 / 6.0)
+    right = tr * (5.0 / 6.0) + br * (1.0 / 6.0)
+    point = (left + right) * 0.5
+    return int(round(float(point[0]))), int(round(float(point[1])))
+
+
 def _filter_depth_min(point_cloud, depth_min_m: float):
     if depth_min_m <= 0.0:
         return point_cloud
@@ -253,6 +281,8 @@ class RealSenseCaptureWorker(QThread):
         depth_max_m: float,
         stride: int,
         include_color: bool,
+        depth_width: int,
+        depth_height: int,
         parent=None,
     ):
         super().__init__(parent)
@@ -267,6 +297,8 @@ class RealSenseCaptureWorker(QThread):
         self.depth_max_m = depth_max_m
         self.stride = stride
         self.include_color = include_color
+        self.depth_width = depth_width
+        self.depth_height = depth_height
 
     def run(self):
         try:
@@ -278,6 +310,8 @@ class RealSenseCaptureWorker(QThread):
                 fps=self.fps,
                 serial=self.serial or None,
                 align_depth_to_color=self.align_depth_to_color,
+                depth_width=self.depth_width,
+                depth_height=self.depth_height,
             ) as camera:
                 if self.isInterruptionRequested():
                     return
@@ -301,16 +335,207 @@ class RealSenseCaptureWorker(QThread):
             self.error_occurred.emit(str(exc))
 
 
+def _make_book_match_config():
+    from el_a3_sdk.realsense import BookSpineMatchConfig
+
+    return BookSpineMatchConfig(
+        match_confidence=0.65,
+        center_tolerance_ratio=0.03,
+        min_center_tolerance_px=45,
+        frame_max_side=0,
+        template_max_side=1200,
+        min_good_matches=12,
+        min_inliers=8,
+        sift_ratio_test=0.72,
+        sift_features=4000,
+        acquire_match_confidence=0.50,
+        acquire_min_good_matches=8,
+        acquire_min_inliers=5,
+        acquire_tile_columns=3,
+        acquire_tile_overlap_ratio=0.20,
+        search_scales=(1.0, 1.5, 2.0),
+        max_scaled_frame_side=1800,
+        use_clahe=True,
+        clahe_clip_limit=2.0,
+        clahe_tile_grid_size=8,
+        roi_expand_ratio=0.45,
+        roi_min_pad=60,
+        roi_reacquire_after_misses=3,
+        polygon_hold_frames=4,
+        min_polygon_area_ratio=0.0002,
+        max_polygon_area_ratio=0.75,
+        min_polygon_fill_ratio=0.35,
+        max_polygon_skew_ratio=3.0,
+        max_polygon_jump_ratio=0.25,
+        max_polygon_area_change_ratio=0.75,
+        polygon_smoothing_alpha=0.25,
+        keep_last_good_on_reject=True,
+        center_smoothing_alpha=0.25,
+        green_confirm_frames=2,
+        red_confirm_frames=5,
+    )
+
+
+class BookSpineDetectWorker(QThread):
+    """Keep capturing until the book spine is confidently detected."""
+
+    detection_finished = pyqtSignal(object, object, object)
+    status_message = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        serial: Optional[str],
+        width: int,
+        height: int,
+        fps: int,
+        warmup: int,
+        timeout_ms: int,
+        align_depth_to_color: bool,
+        depth_min_m: float,
+        depth_max_m: float,
+        stride: int,
+        include_color: bool,
+        depth_width: int,
+        depth_height: int,
+        template_path: Path,
+        config: object,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.serial = serial
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.warmup = warmup
+        self.timeout_ms = timeout_ms
+        self.align_depth_to_color = align_depth_to_color
+        self.depth_min_m = depth_min_m
+        self.depth_max_m = depth_max_m
+        self.stride = stride
+        self.include_color = include_color
+        self.depth_width = depth_width
+        self.depth_height = depth_height
+        self.template_path = template_path
+        self.config = config
+
+    def run(self):
+        try:
+            from el_a3_sdk.realsense import BookSpineMatcher, RealSenseD435, match_with_fallback
+
+            with RealSenseD435(
+                width=self.width,
+                height=self.height,
+                fps=self.fps,
+                serial=self.serial or None,
+                align_depth_to_color=self.align_depth_to_color,
+                depth_width=self.depth_width,
+                depth_height=self.depth_height,
+            ) as camera:
+                if self.isInterruptionRequested():
+                    return
+                camera.warmup(frame_count=self.warmup, timeout_ms=self.timeout_ms)
+                matcher = BookSpineMatcher.from_template_path(self.template_path, self.config)
+
+                while not self.isInterruptionRequested():
+                    frame = camera.get_frame(timeout_ms=self.timeout_ms)
+                    if self.isInterruptionRequested():
+                        return
+
+                    point_cloud = frame.to_point_cloud(
+                        max_depth_m=self.depth_max_m,
+                        stride=self.stride,
+                        include_color=self.include_color,
+                    )
+                    point_cloud = _filter_depth_min(point_cloud, self.depth_min_m)
+                    if point_cloud.size == 0:
+                        self.status_message.emit("点云为空，继续重采集...")
+                        continue
+
+                    result = match_with_fallback(
+                        frame.color_bgr,
+                        matcher.backends,
+                        frame_max_side=self.config.frame_max_side,
+                        search_rect=None,
+                        match_confidence=self.config.match_confidence,
+                        search_scales=self.config.search_scales,
+                        max_scaled_frame_side=self.config.max_scaled_frame_side,
+                        use_clahe=self.config.use_clahe,
+                        clahe_clip_limit=self.config.clahe_clip_limit,
+                        clahe_tile_grid_size=self.config.clahe_tile_grid_size,
+                        min_good_matches=self.config.min_good_matches,
+                        min_inliers=self.config.min_inliers,
+                        polygon_validator=lambda _polygon, _shape: True,
+                    )
+                    if result.polygon is None:
+                        self.status_message.emit(
+                            f"识别未达标，重采集中: score={result.match_confidence:.2f} "
+                            f"good={result.good_count} inliers={result.inlier_count}"
+                        )
+                        continue
+
+                    self.detection_finished.emit(frame, point_cloud, result)
+                    return
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+
 class RealSensePointPanel(QWidget):
     """Point cloud capture, target picking, and MoveL confirmation page."""
 
+    DEFAULT_SERIAL = None
+    # D435-class devices cannot usually run depth+color both at 1920x1080.
+    # 1280x720 is the highest common RGB-D mode used for aligned point clouds.
+    DEFAULT_WIDTH = 1920
+    DEFAULT_HEIGHT = 1080
+    DEFAULT_FPS = 30
+    DEFAULT_WARMUP = 30
+    DEFAULT_TIMEOUT_MS = 5000
+    DEFAULT_DEPTH_MIN_M = 0.0
+    DEFAULT_DEPTH_MAX_M = 2.0
+    DEFAULT_STRIDE = 1
+    DEFAULT_MAX_POINTS = 150000
+    DEFAULT_POINT_SIZE = 2.0
+    DEFAULT_ALIGN_DEPTH_TO_COLOR = True
+    DEFAULT_INCLUDE_COLOR = True
+    DEFAULT_FLIP_VIEW = True
+    DEFAULT_DEPTH_WIDTH = 1280
+    DEFAULT_DEPTH_HEIGHT = 720
+    DEFAULT_ROD_PORT = "/dev/rodmotor"
+    DEFAULT_ROD_BAUD = 921600
+    DEFAULT_ROD_TIMEOUT_S = 0.3
+    DEFAULT_ROD_SPEED = 1000
+    DEFAULT_ROD_ACC = 50
+    DEFAULT_ROD_TORQUE = 1.0
+    DEFAULT_TARGET_Y_OFFSET_CM = -1.0
+    DEFAULT_TARGET_Z_OFFSET_CM = -5.0
+    DEFAULT_ROD_GRASP_DEG = 115.0
+    DEFAULT_GRIPPER_OPEN_DEG = 0.0
+    DEFAULT_GRIPPER_CLOSE_DEG = 108.5
+    DEFAULT_GRIPPER_HOLD_EFFORT_NM = 0.12
+    DEFAULT_GRIPPER_KP = 18.0
+    DEFAULT_GRIPPER_KD = 2.0
+    DEFAULT_GRASP_RPY_DEG = (75.0, 0.0, 90.0)
+    DEFAULT_DEBUG_JOINTS_DEG = (0.0, 35.0, -45.0, 0.0, 0.0, 0.0)
+    DEFAULT_TURN_STAGE1_JOINTS_DEG = (-90.0, 35.0, -40.0, 0.0, 0.0, 0.0)
+    DEFAULT_TURN_STAGE2_JOINTS_DEG = (-180.0, 35.0, -40.0, 0.0, 0.0, 0.0)
+    DEFAULT_TURN_DURATION_S = 6.0
+    DEFAULT_DEBUG_MOVE_DURATION_S = 8.0
+
     move_l_requested = pyqtSignal(list, float)
+    move_l_block_requested = pyqtSignal(list, float)
+    move_j_block_requested = pyqtSignal(list, float)
+    gripper_requested = pyqtSignal(float, float, float, float)
+    rod_connect_requested = pyqtSignal(str, int, float)
+    rod_write_requested = pyqtSignal(float, int, int, float)
     log_message = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._capture_worker: Optional[RealSenseCaptureWorker] = None
+        self._detect_worker: Optional[BookSpineDetectWorker] = None
         self._frame = None
         self._point_cloud = None
         self._display_indices: Optional[np.ndarray] = None
@@ -325,12 +550,36 @@ class RealSensePointPanel(QWidget):
         self._selected_camera_point_m: Optional[np.ndarray] = None
         self._selected_robot_target_raw_m: Optional[np.ndarray] = None
         self._target_robot_point_m: Optional[np.ndarray] = None
+        self._book_spine_pick: Optional[object] = None
         self._tcp_offset = np.zeros(6, dtype=float)
         self._current_end_pose = None
         self._rpy_initialized = False
         self._arm_enabled = False
+        self._rod_connected = False
+        self._flow_active = False
+        self._flow_step_index = 0
+        self._flow_waiting_motion = False
+        self._flow_rollback_waiting = False
+        self._flow_pose_history: list[tuple[int, str, list[float]]] = []
+        self._flow_approach_pose: Optional[list[float]] = None
         self._viewer_visible = False
         self._viewer_widget = None
+        self._serial = self.DEFAULT_SERIAL
+        self._width = self.DEFAULT_WIDTH
+        self._height = self.DEFAULT_HEIGHT
+        self._depth_width = self.DEFAULT_DEPTH_WIDTH
+        self._depth_height = self.DEFAULT_DEPTH_HEIGHT
+        self._fps = self.DEFAULT_FPS
+        self._warmup = self.DEFAULT_WARMUP
+        self._timeout_ms = self.DEFAULT_TIMEOUT_MS
+        self._depth_min_m = self.DEFAULT_DEPTH_MIN_M
+        self._depth_max_m = self.DEFAULT_DEPTH_MAX_M
+        self._stride = self.DEFAULT_STRIDE
+        self._max_points = self.DEFAULT_MAX_POINTS
+        self._point_size = self.DEFAULT_POINT_SIZE
+        self._align_depth_to_color = self.DEFAULT_ALIGN_DEPTH_TO_COLOR
+        self._include_color = self.DEFAULT_INCLUDE_COLOR
+        self._flip_view = self.DEFAULT_FLIP_VIEW
         self._init_ui()
 
     def _init_ui(self):
@@ -342,21 +591,35 @@ class RealSensePointPanel(QWidget):
         controls_layout = QVBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(6)
-        controls_layout.addWidget(self._create_capture_group())
-        controls_layout.addWidget(self._create_transform_group())
-        controls_layout.addWidget(self._create_result_group())
-        controls_layout.addWidget(self._create_move_group())
+        self._hidden_control_groups = [
+            self._create_capture_group(),
+            self._create_book_group(),
+            self._create_result_group(),
+            self._create_move_group(),
+        ]
+        for group in self._hidden_control_groups:
+            group.hide()
+        controls_layout.addWidget(self._create_book_grasp_group())
         controls_layout.addStretch()
         root.addLayout(controls_layout, 1)
 
         self.status_label = QLabel(tr("pc.ready"))
-        root.addWidget(self.status_label)
+        self.status_label.hide()
         self._update_move_button_state()
 
     def _create_viewer_widget(self):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.rgb_preview_label = QLabel(container)
+        self.rgb_preview_label.setFixedSize(300, 210)
+        self.rgb_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rgb_preview_label.setScaledContents(False)
+        self.rgb_preview_label.setStyleSheet(
+            "QLabel { background: rgba(15, 18, 24, 210); border: 1px solid rgba(255, 255, 255, 120); }"
+        )
+        self.rgb_preview_label.hide()
+        container.installEventFilter(self)
         if HAS_PYVISTA:
             self._plotter = None
             self._plotter_placeholder = QLabel(tr("pc.viewer_loading"))
@@ -395,6 +658,7 @@ class RealSensePointPanel(QWidget):
             self._plotter_placeholder = None
 
         layout.addWidget(self._plotter.interactor)
+        self._position_rgb_preview()
         self._install_event_filter()
         self._reset_scene()
 
@@ -420,106 +684,28 @@ class RealSensePointPanel(QWidget):
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(6)
 
-        self.serial_label = QLabel(tr("pc.serial"))
-        self.serial_edit = QLineEdit()
-        self.serial_edit.setPlaceholderText(tr("pc.serial_placeholder"))
-        layout.addWidget(self.serial_label, 0, 0)
-        layout.addWidget(self.serial_edit, 0, 1)
-
-        self.width_label = QLabel(tr("pc.width"))
-        self.width_spin = self._make_int_spin(160, 1920, 640, 10)
-        layout.addWidget(self.width_label, 0, 2)
-        layout.addWidget(self.width_spin, 0, 3)
-
-        self.height_label = QLabel(tr("pc.height"))
-        self.height_spin = self._make_int_spin(120, 1080, 480, 10)
-        layout.addWidget(self.height_label, 0, 4)
-        layout.addWidget(self.height_spin, 0, 5)
-
-        self.fps_label = QLabel(tr("pc.fps"))
-        self.fps_spin = self._make_int_spin(1, 90, 30, 1)
-        layout.addWidget(self.fps_label, 1, 0)
-        layout.addWidget(self.fps_spin, 1, 1)
-
-        self.warmup_label = QLabel(tr("pc.warmup"))
-        self.warmup_spin = self._make_int_spin(0, 120, 30, 1)
-        layout.addWidget(self.warmup_label, 1, 2)
-        layout.addWidget(self.warmup_spin, 1, 3)
-
-        self.timeout_label = QLabel(tr("pc.timeout"))
-        self.timeout_spin = self._make_int_spin(500, 30000, 5000, 500)
-        self.timeout_spin.setSuffix(" ms")
-        layout.addWidget(self.timeout_label, 1, 4)
-        layout.addWidget(self.timeout_spin, 1, 5)
-
-        self.depth_min_label = QLabel(tr("pc.depth_min"))
-        self.depth_min_spin = self._make_float_spin(0.0, 10.0, 0.0, 0.01, " m")
-        layout.addWidget(self.depth_min_label, 2, 0)
-        layout.addWidget(self.depth_min_spin, 2, 1)
-
-        self.depth_max_label = QLabel(tr("pc.depth_max"))
-        self.depth_max_spin = self._make_float_spin(0.01, 10.0, 2.0, 0.01, " m")
-        layout.addWidget(self.depth_max_label, 2, 2)
-        layout.addWidget(self.depth_max_spin, 2, 3)
-
-        self.stride_label = QLabel(tr("pc.stride"))
-        self.stride_spin = self._make_int_spin(1, 16, 1, 1)
-        layout.addWidget(self.stride_label, 2, 4)
-        layout.addWidget(self.stride_spin, 2, 5)
-
-        self.max_points_label = QLabel(tr("pc.max_points"))
-        self.max_points_spin = self._make_int_spin(1000, 400000, 150000, 10000)
-        layout.addWidget(self.max_points_label, 3, 0)
-        layout.addWidget(self.max_points_spin, 3, 1)
-
-        self.point_size_label = QLabel(tr("pc.point_size"))
-        self.point_size_spin = self._make_float_spin(1.0, 10.0, 2.0, 0.5, "")
-        self.point_size_spin.valueChanged.connect(
-            lambda _value: self._redisplay_current_cloud()
-        )
-        layout.addWidget(self.point_size_label, 3, 2)
-        layout.addWidget(self.point_size_spin, 3, 3)
-
-        self.align_check = QCheckBox(tr("pc.align_depth"))
-        self.align_check.setChecked(True)
-        layout.addWidget(self.align_check, 3, 4, 1, 2)
-
-        self.color_check = QCheckBox(tr("pc.use_color"))
-        self.color_check.setChecked(True)
-        layout.addWidget(self.color_check, 4, 0, 1, 2)
-
-        self.flip_view_check = QCheckBox(tr("pc.flip_view"))
-        self.flip_view_check.setChecked(True)
-        self.flip_view_check.toggled.connect(
-            lambda _checked: self._redisplay_current_cloud()
-        )
-        layout.addWidget(self.flip_view_check, 4, 2, 1, 2)
-
         self.pick_mode_btn = QPushButton(tr("pc.pick_mode"))
         self.pick_mode_btn.setCheckable(True)
         self.pick_mode_btn.setChecked(True)
         self.pick_mode_btn.toggled.connect(
             lambda _checked: self._update_pick_mode_state()
         )
-        layout.addWidget(self.pick_mode_btn, 4, 4)
+        layout.addWidget(self.pick_mode_btn, 0, 0)
 
         self.capture_btn = QPushButton(tr("pc.capture"))
         self.capture_btn.setObjectName("enableBtn")
         self.capture_btn.clicked.connect(self._start_capture)
-        layout.addWidget(self.capture_btn, 4, 5)
+        layout.addWidget(self.capture_btn, 0, 1)
+        layout.setColumnStretch(2, 1)
 
         return self.capture_group
 
-    def _create_transform_group(self):
-        self.transform_group = QGroupBox(tr("pc.transform_group"))
-        layout = QVBoxLayout(self.transform_group)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
-        self.transform_summary = QLabel("")
-        self.transform_summary.setWordWrap(True)
-        layout.addWidget(self.transform_summary)
-        self._update_transform_summary()
-        return self.transform_group
+    def _create_book_group(self):
+        self.book_group = QGroupBox(tr("pc.book_group"))
+        layout = QGridLayout(self.book_group)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+        return self.book_group
 
     def _create_result_group(self):
         self.result_group = QGroupBox(tr("pc.result_group"))
@@ -527,25 +713,16 @@ class RealSensePointPanel(QWidget):
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.pixel_label = QLabel(tr("pc.pixel"))
-        self.camera_point_label = QLabel(tr("pc.camera_point"))
         self.robot_point_cm_label = QLabel(tr("pc.move_target_point_cm"))
-        self.robot_point_m_label = QLabel(tr("pc.move_target_point_m"))
         self.target_point_cm_label = QLabel(tr("pc.target_point_cm"))
-        self.target_point_m_label = QLabel(tr("pc.target_point_m"))
 
         self.pixel_value = QLabel("--")
-        self.camera_point_value = QLabel("--")
         self.move_target_point_cm_value = QLabel("--")
-        self.move_target_point_m_value = QLabel("--")
         self.target_point_cm_value = QLabel("--")
-        self.target_point_m_value = QLabel("--")
 
         layout.addRow(self.pixel_label, self.pixel_value)
-        layout.addRow(self.camera_point_label, self.camera_point_value)
         layout.addRow(self.robot_point_cm_label, self.move_target_point_cm_value)
-        layout.addRow(self.robot_point_m_label, self.move_target_point_m_value)
         layout.addRow(self.target_point_cm_label, self.target_point_cm_value)
-        layout.addRow(self.target_point_m_label, self.target_point_m_value)
         return self.result_group
 
     def _create_move_group(self):
@@ -583,6 +760,168 @@ class RealSensePointPanel(QWidget):
         layout.addLayout(row, 1, 2, 1, 4)
         return self.move_group
 
+    def _create_book_grasp_group(self):
+        self.grasp_group = QGroupBox("书籍夹取流程")
+        layout = QGridLayout(self.grasp_group)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+
+        row = 0
+        layout.addWidget(QLabel("预抓 X 偏移:"), row, 0)
+        self.pregrasp_x_offset_spin = self._make_float_spin(-50.0, 50.0, 10.0, 1.0, " cm")
+        layout.addWidget(self.pregrasp_x_offset_spin, row, 1)
+        layout.addWidget(QLabel("夹取 X 移动:"), row, 2)
+        self.approach_x_delta_spin = self._make_float_spin(-50.0, 50.0, -10.0, 1.0, " cm")
+        layout.addWidget(self.approach_x_delta_spin, row, 3)
+
+        row += 1
+        layout.addWidget(QLabel("识别模板:"), row, 0)
+        self.template_combo = QComboBox()
+        for label, path in BOOK_TEMPLATE_OPTIONS:
+            self.template_combo.addItem(label, str(path))
+        self.template_combo.setEditable(False)
+        layout.addWidget(self.template_combo, row, 1, 1, 3)
+
+        row += 1
+        layout.addWidget(QLabel("目标 Y 补偿:"), row, 0)
+        self.target_y_offset_spin = self._make_float_spin(
+            -20.0,
+            20.0,
+            self.DEFAULT_TARGET_Y_OFFSET_CM,
+            0.5,
+            " cm",
+        )
+        layout.addWidget(self.target_y_offset_spin, row, 1)
+        layout.addWidget(QLabel("目标 Z 补偿:"), row, 2)
+        self.target_z_offset_spin = self._make_float_spin(
+            -20.0,
+            20.0,
+            self.DEFAULT_TARGET_Z_OFFSET_CM,
+            0.5,
+            " cm",
+        )
+        layout.addWidget(self.target_z_offset_spin, row, 3)
+
+        row += 1
+        layout.addWidget(QLabel("杆扭矩:"), row, 0)
+        self.rod_torque_spin = self._make_float_spin(
+            0.0,
+            100.0,
+            self.DEFAULT_ROD_TORQUE,
+            0.5,
+            "",
+        )
+        layout.addWidget(self.rod_torque_spin, row, 1)
+
+        row += 1
+        layout.addWidget(QLabel("杆零位:"), row, 0)
+        self.rod_zero_spin = self._make_float_spin(-180.0, 180.0, 0.0, 1.0, "°")
+        layout.addWidget(self.rod_zero_spin, row, 1)
+        layout.addWidget(QLabel("杆夹取位:"), row, 2)
+        self.rod_grasp_spin = self._make_float_spin(
+            -180.0,
+            180.0,
+            self.DEFAULT_ROD_GRASP_DEG,
+            1.0,
+            "°",
+        )
+        layout.addWidget(self.rod_grasp_spin, row, 3)
+
+        row += 1
+        layout.addWidget(QLabel("MoveL 时间:"), row, 0)
+        self.flow_movel_duration_spin = self._make_float_spin(0.5, 30.0, 2.0, 0.5, " s")
+        layout.addWidget(self.flow_movel_duration_spin, row, 1)
+        layout.addWidget(QLabel("转身时间:"), row, 2)
+        self.flow_turn_duration_spin = self._make_float_spin(
+            3.0,
+            20.0,
+            self.DEFAULT_TURN_DURATION_S,
+            0.5,
+            " s",
+        )
+        layout.addWidget(self.flow_turn_duration_spin, row, 3)
+
+        row += 1
+        layout.addWidget(QLabel("回调试位时间:"), row, 0)
+        self.flow_debug_duration_spin = self._make_float_spin(
+            3.0,
+            20.0,
+            self.DEFAULT_DEBUG_MOVE_DURATION_S,
+            0.5,
+            " s",
+        )
+        layout.addWidget(self.flow_debug_duration_spin, row, 1)
+        row += 1
+        layout.addWidget(QLabel("夹爪开/关:"), row, 0)
+        gripper_row = QHBoxLayout()
+        self.gripper_open_spin = self._make_float_spin(-30.0, 140.0, self.DEFAULT_GRIPPER_OPEN_DEG, 1.0, "°")
+        self.gripper_close_spin = self._make_float_spin(-30.0, 140.0, self.DEFAULT_GRIPPER_CLOSE_DEG, 1.0, "°")
+        gripper_row.addWidget(self.gripper_open_spin)
+        gripper_row.addWidget(self.gripper_close_spin)
+        layout.addLayout(gripper_row, row, 2, 1, 2)
+
+        row += 1
+        layout.addWidget(QLabel("杆串口:"), row, 0)
+        self.rod_port_edit = QLineEdit(self.DEFAULT_ROD_PORT)
+        layout.addWidget(self.rod_port_edit, row, 1)
+        layout.addWidget(QLabel("波特率/超时:"), row, 2)
+        rod_conn_row = QHBoxLayout()
+        self.rod_baud_spin = self._make_int_spin(9600, 4000000, self.DEFAULT_ROD_BAUD, 115200)
+        self.rod_timeout_spin = self._make_float_spin(0.05, 2.0, self.DEFAULT_ROD_TIMEOUT_S, 0.05, " s")
+        rod_conn_row.addWidget(self.rod_baud_spin)
+        rod_conn_row.addWidget(self.rod_timeout_spin)
+        layout.addLayout(rod_conn_row, row, 3, 1, 2)
+
+        row += 1
+        layout.addWidget(QLabel("速度/加速度:"), row, 0)
+        rod_motion_row = QHBoxLayout()
+        self.rod_speed_spin = self._make_int_spin(1, 10000, self.DEFAULT_ROD_SPEED, 100)
+        self.rod_acc_spin = self._make_int_spin(1, 10000, self.DEFAULT_ROD_ACC, 10)
+        rod_motion_row.addWidget(self.rod_speed_spin)
+        rod_motion_row.addWidget(self.rod_acc_spin)
+        layout.addLayout(rod_motion_row, row, 1, 1, 2)
+
+        row += 1
+        self.flow_status_label = QLabel("流程未开始")
+        self.flow_status_label.setWordWrap(True)
+        layout.addWidget(self.flow_status_label, row, 0, 1, 5)
+
+        row += 1
+        self.book_status_label = QLabel(tr("pc.book_ready"))
+        self.book_status_label.setWordWrap(True)
+        layout.addWidget(self.book_status_label, row, 0, 1, 5)
+
+        row += 1
+        self.flow_steps_btn = QPushButton("查看完整流程")
+        self.flow_steps_btn.clicked.connect(self._show_flow_steps_dialog)
+        layout.addWidget(self.flow_steps_btn, row, 0, 1, 5)
+
+        row += 1
+        self.flow_target_label = QLabel("目标点: --")
+        self.flow_target_label.setWordWrap(True)
+        layout.addWidget(self.flow_target_label, row, 0, 1, 5)
+
+        row += 1
+        btn_row = QHBoxLayout()
+        self.flow_reset_btn = QPushButton("重置流程")
+        self.flow_reset_btn.clicked.connect(self._reset_book_grasp_flow)
+        btn_row.addWidget(self.flow_reset_btn)
+        self.flow_back_btn = QPushButton("回退到上一步位置")
+        self.flow_back_btn.clicked.connect(self._rollback_to_previous_flow_pose)
+        btn_row.addWidget(self.flow_back_btn)
+        self.flow_detect_btn = QPushButton("识别书籍")
+        self.flow_detect_btn.clicked.connect(self._detect_book_target)
+        btn_row.addWidget(self.flow_detect_btn)
+        self.flow_next_btn = QPushButton("开始/执行下一步")
+        self.flow_next_btn.setObjectName("enableBtn")
+        self.flow_next_btn.clicked.connect(self._execute_next_book_grasp_step)
+        btn_row.addWidget(self.flow_next_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row, row, 0, 1, 5)
+
+        self._update_flow_button_state()
+        return self.grasp_group
+
     @staticmethod
     def _make_int_spin(lo: int, hi: int, value: int, step: int) -> QSpinBox:
         spin = QSpinBox()
@@ -612,7 +951,7 @@ class RealSensePointPanel(QWidget):
     def _start_capture(self):
         if self._capture_worker is not None and self._capture_worker.isRunning():
             return
-        if self.depth_max_spin.value() <= self.depth_min_spin.value():
+        if self._depth_max_m <= self._depth_min_m:
             self._set_error(tr("pc.depth_range_error"))
             return
 
@@ -622,17 +961,19 @@ class RealSensePointPanel(QWidget):
         self._clear_selection()
 
         self._capture_worker = RealSenseCaptureWorker(
-            serial=self.serial_edit.text().strip() or None,
-            width=self.width_spin.value(),
-            height=self.height_spin.value(),
-            fps=self.fps_spin.value(),
-            warmup=self.warmup_spin.value(),
-            timeout_ms=self.timeout_spin.value(),
-            align_depth_to_color=self.align_check.isChecked(),
-            depth_min_m=self.depth_min_spin.value(),
-            depth_max_m=self.depth_max_spin.value(),
-            stride=self.stride_spin.value(),
-            include_color=self.color_check.isChecked(),
+            serial=self._serial,
+            width=self._width,
+            height=self._height,
+            fps=self._fps,
+            warmup=self._warmup,
+            timeout_ms=self._timeout_ms,
+            align_depth_to_color=self._align_depth_to_color,
+            depth_min_m=self._depth_min_m,
+            depth_max_m=self._depth_max_m,
+            stride=self._stride,
+            include_color=self._include_color,
+            depth_width=self._depth_width,
+            depth_height=self._depth_height,
             parent=self,
         )
         self._capture_worker.capture_finished.connect(self._on_capture_finished)
@@ -643,6 +984,8 @@ class RealSensePointPanel(QWidget):
     def _on_capture_finished(self, frame, point_cloud):
         self._frame = frame
         self._point_cloud = point_cloud
+        self._book_spine_pick = None
+        self.rgb_preview_label.hide()
         self._selected_display_index = None
         self._selected_raw_index = None
         self._selected_camera_point_m = None
@@ -657,12 +1000,90 @@ class RealSensePointPanel(QWidget):
             tr("pc.capture_done", n=point_cloud.size, frame=frame.frame_number)
         )
         self._update_move_button_state()
+        if self._flow_active and self._flow_step_index == 0:
+            self._advance_book_grasp_flow("点云采集完成")
+
+    def _detect_book_target(self):
+        try:
+            if self._detect_worker is not None and self._detect_worker.isRunning():
+                return
+
+            template = Path(
+                self.template_combo.currentData() or str(DEFAULT_BOOK_TEMPLATE_PATH)
+            )
+            self._detect_worker = BookSpineDetectWorker(
+                serial=self._serial,
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+                warmup=self._warmup,
+                timeout_ms=self._timeout_ms,
+                align_depth_to_color=self._align_depth_to_color,
+                depth_min_m=self._depth_min_m,
+                depth_max_m=self._depth_max_m,
+                stride=self._stride,
+                include_color=self._include_color,
+                depth_width=self._depth_width,
+                depth_height=self._depth_height,
+                template_path=template,
+                config=_make_book_match_config(),
+                parent=self,
+            )
+            self._detect_worker.detection_finished.connect(self._on_book_detection_finished)
+            self._detect_worker.status_message.connect(self._on_book_detection_status)
+            self._detect_worker.error_occurred.connect(self._on_capture_error)
+            self._detect_worker.finished.connect(self._on_book_detection_thread_finished)
+
+            self.capture_btn.setEnabled(False)
+            self.flow_detect_btn.setEnabled(False)
+            self.capture_btn.setText(tr("pc.capturing"))
+            self.status_label.setText(tr("pc.capturing"))
+            self.book_status_label.setText(
+                f"识别中，模板={self.template_combo.currentText()}，未达标会自动重采集..."
+            )
+            self._clear_selection()
+            self._detect_worker.start()
+        except Exception as exc:
+            self._on_capture_error(str(exc))
 
     def _on_capture_error(self, message: str):
         self._set_error(tr("pc.capture_error", msg=message))
 
     def _on_capture_thread_finished(self):
         self.capture_btn.setEnabled(True)
+        self.capture_btn.setText(tr("pc.capture"))
+
+    def _on_book_detection_status(self, message: str):
+        self.book_status_label.setText(message)
+
+    def _on_book_detection_finished(self, frame, point_cloud, pick):
+        self._frame = frame
+        self._point_cloud = point_cloud
+        self._book_spine_pick = pick
+        self.rgb_preview_label.hide()
+        self._display_cloud(point_cloud)
+
+        polygon = np.asarray(pick.polygon, dtype=float).reshape(-1, 2)
+        u, v = _book_pick_point_from_polygon(polygon)
+        camera_point = np.asarray(
+            self._frame.point_at_pixel(u, v, max_depth_m=self._depth_max_m),
+            dtype=float,
+        )
+        robot_point = camera_point_to_robot_target(camera_point)
+        pixels = np.asarray([u, v], dtype=int)
+        raw_index = self._nearest_point_index_from_pixel(pixels)
+        self.book_status_label.setText(
+            f"score={pick.match_confidence:.2f}  good={pick.good_count}  inliers={pick.inlier_count}"
+        )
+        self._show_book_preview(pick)
+        self._apply_book_pick(raw_index, camera_point, robot_point, pixels, polygon)
+        self.status_label.setText(tr("pc.book_point_selected"))
+        if self._flow_active and self._flow_step_index == 1:
+            self._advance_book_grasp_flow("书籍识别完成，目标点已自动选中")
+
+    def _on_book_detection_thread_finished(self):
+        self.capture_btn.setEnabled(True)
+        self.flow_detect_btn.setEnabled(True)
         self.capture_btn.setText(tr("pc.capture"))
 
     def _display_cloud(self, point_cloud):
@@ -672,14 +1093,14 @@ class RealSensePointPanel(QWidget):
 
         points = np.asarray(point_cloud.points_xyz_m, dtype=np.float64)
         count = len(points)
-        max_points = max(1, self.max_points_spin.value())
+        max_points = max(1, self._max_points)
         if count > max_points:
             indices = np.linspace(0, count - 1, max_points, dtype=np.int64)
         else:
             indices = np.arange(count, dtype=np.int64)
 
         display_points = points[indices].copy()
-        if self.flip_view_check.isChecked():
+        if self._flip_view:
             display_points[:, 1] *= -1.0
             display_points[:, 2] *= -1.0
 
@@ -698,7 +1119,7 @@ class RealSensePointPanel(QWidget):
                 np.arange(len(display_points), dtype=np.int64),
             )
         ).ravel()
-        point_size = float(self.point_size_spin.value())
+        point_size = float(self._point_size)
         if colors is not None and len(colors) == len(display_points):
             cloud_poly["rgb"] = colors
             self._cloud_actor = self._plotter.add_mesh(
@@ -742,6 +1163,14 @@ class RealSensePointPanel(QWidget):
         except Exception:
             pass
 
+    def _camera_point_to_display_point(self, camera_point: Sequence[float]) -> np.ndarray:
+        point = np.asarray(camera_point, dtype=float).reshape(3)
+        if self._flip_view:
+            point = point.copy()
+            point[1] *= -1.0
+            point[2] *= -1.0
+        return point
+
     def _redisplay_current_cloud(self):
         if self._point_cloud is not None:
             self._display_cloud(self._point_cloud)
@@ -767,6 +1196,10 @@ class RealSensePointPanel(QWidget):
         self._filter_installed = True
 
     def eventFilter(self, obj, event):
+        if obj is self._viewer_widget and event.type() == QEvent.Type.Resize:
+            self._position_rgb_preview()
+            return False
+
         if (
             not HAS_PYVISTA
             or self._plotter is None
@@ -789,6 +1222,44 @@ class RealSensePointPanel(QWidget):
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
             return False
         return False
+
+    def _position_rgb_preview(self):
+        if not hasattr(self, "rgb_preview_label") or self._viewer_widget is None:
+            return
+        margin = 14
+        x = max(margin, self._viewer_widget.width() - self.rgb_preview_label.width() - margin)
+        self.rgb_preview_label.move(x, margin)
+        self.rgb_preview_label.raise_()
+
+    def _show_book_preview(self, pick):
+        if self._frame is None or not hasattr(self, "rgb_preview_label") or cv2 is None:
+            return
+
+        image_bgr = self._frame.color_bgr.copy()
+        corners = np.asarray(pick.polygon, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(image_bgr, [corners], True, (0, 0, 255), 5, cv2.LINE_AA)
+        u, v = _book_pick_point_from_polygon(pick.polygon)
+        cv2.circle(image_bgr, (int(u), int(v)), 12, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(image_bgr, (int(u), int(v)), 15, (0, 0, 255), 3, cv2.LINE_AA)
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        height, width, channels = image_rgb.shape
+        bytes_per_line = channels * width
+        qimage = QImage(
+            image_rgb.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format.Format_RGB888,
+        ).copy()
+        pixmap = QPixmap.fromImage(qimage).scaled(
+            self.rgb_preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.rgb_preview_label.setPixmap(pixmap)
+        self.rgb_preview_label.show()
+        self._position_rgb_preview()
 
     def _pick_display_point(self, event) -> Optional[tuple[int, np.ndarray]]:
         if self._display_points is None or self._plotter is None:
@@ -910,7 +1381,7 @@ class RealSensePointPanel(QWidget):
             if best_index is None:
                 return None
 
-            point_size = max(1.0, float(self.point_size_spin.value()))
+            point_size = max(1.0, float(self._point_size))
             threshold_px = max(12.0, point_size * 5.0)
             if best_dist_sq > threshold_px * threshold_px:
                 logger.debug(
@@ -945,13 +1416,107 @@ class RealSensePointPanel(QWidget):
             self.pixel_value.setText(f"u={int(pixels[0])}, v={int(pixels[1])}")
         else:
             self.pixel_value.setText("--")
-        self.camera_point_value.setText(_format_vec_m(camera_point))
         self.move_target_point_cm_value.setText(_format_vec_cm(self._target_robot_point_m))
-        self.move_target_point_m_value.setText(_format_vec_m(self._target_robot_point_m))
 
         self._add_selection_marker(display_index, self._selected_display_point_m)
         self._recompute_target_from_selection()
         self.status_label.setText(tr("pc.point_selected"))
+
+    def _nearest_point_index_from_pixel(self, pixel_uv: np.ndarray) -> int:
+        if self._point_cloud is None:
+            return -1
+        pixels = np.asarray(self._point_cloud.pixels_uv, dtype=int)
+        if pixels.size == 0:
+            return -1
+        diffs = pixels - pixel_uv.reshape(1, 2)
+        distances = np.sum(diffs.astype(float) ** 2, axis=1)
+        return int(np.argmin(distances))
+
+    def _apply_book_pick(
+        self,
+        raw_index: int,
+        camera_point: np.ndarray,
+        robot_point: np.ndarray,
+        pixels: np.ndarray,
+        corners: np.ndarray,
+    ):
+        if self._point_cloud is None:
+            return
+
+        if raw_index < 0:
+            raw_index = self._nearest_point_index_from_pixel(pixels)
+        if raw_index >= 0 and self._display_indices is not None:
+            display_candidates = np.where(self._display_indices == raw_index)[0]
+            if len(display_candidates) > 0:
+                display_index = int(display_candidates[0])
+                self._select_display_point(
+                    display_index,
+                    self._display_points[display_index],
+                )
+                return
+
+        self._selected_display_index = None
+        self._selected_display_point_m = self._camera_point_to_display_point(camera_point)
+        self._selected_raw_index = int(raw_index)
+        self._selected_camera_point_m = np.asarray(camera_point, dtype=float).reshape(3)
+        self._selected_robot_target_raw_m = np.asarray(robot_point, dtype=float).reshape(3)
+        self._target_robot_point_m = np.asarray(robot_point, dtype=float).reshape(3)
+        self.pixel_value.setText(f"u={int(pixels[0])}, v={int(pixels[1])}")
+        self.move_target_point_cm_value.setText(_format_vec_cm(robot_point))
+        corrected_target = apply_tcp_offset_correction(
+            self._selected_robot_target_raw_m,
+            self._tcp_offset,
+            np.array(
+                [
+                    math.radians(self.rpy_spins[0].value()),
+                    math.radians(self.rpy_spins[1].value()),
+                    math.radians(self.rpy_spins[2].value()),
+                ],
+                dtype=float,
+            ),
+        )
+        self.target_point_cm_value.setText(_format_vec_cm(corrected_target))
+        self._add_book_marker(corners, self._selected_display_point_m)
+        self._update_move_button_state()
+
+    def _add_book_marker(self, corners: np.ndarray, display_point: np.ndarray):
+        if not HAS_PYVISTA or self._plotter is None:
+            return
+        try:
+            if self._selected_actor is not None:
+                self._plotter.remove_actor(self._selected_actor)
+                self._selected_actor = None
+            self._selected_actor = self._plotter.add_points(
+                np.asarray(display_point, dtype=float).reshape(1, 3),
+                color="#ffcc00",
+                point_size=max(10.0, float(self._point_size) * 6.0),
+                render_points_as_spheres=True,
+                name="book_detect_point",
+            )
+            if corners is not None and len(corners) == 4:
+                world = []
+                for u, v in np.asarray(corners, dtype=float):
+                    if self._frame is None:
+                        continue
+                    try:
+                        world_point = self._frame.point_at_pixel(
+                            int(round(u)),
+                            int(round(v)),
+                            max_depth_m=self._depth_max_m,
+                        )
+                        world.append(self._camera_point_to_display_point(world_point))
+                    except Exception:
+                        continue
+                if len(world) >= 2:
+                    self._plotter.add_lines(
+                        np.asarray(world, dtype=float),
+                        color="#ff8800",
+                        width=3,
+                        name="book_detect_box",
+                    )
+            self._plotter.render()
+        except Exception:
+            pass
 
     def _add_selection_marker(
         self,
@@ -972,7 +1537,7 @@ class RealSensePointPanel(QWidget):
 
         try:
             marker_points = np.asarray(point, dtype=float).reshape(1, 3)
-            marker_size = max(10.0, float(self.point_size_spin.value()) * 6.0)
+            marker_size = max(10.0, float(self._point_size) * 6.0)
             self._selected_actor = self._plotter.add_points(
                 marker_points,
                 color="#ffcc00",
@@ -985,7 +1550,6 @@ class RealSensePointPanel(QWidget):
             pass
 
     def _recompute_target_from_selection(self):
-        self._update_transform_summary()
         if self._selected_robot_target_raw_m is None:
             return
 
@@ -999,32 +1563,13 @@ class RealSensePointPanel(QWidget):
         )
         if self._target_robot_point_m is not None:
             self.move_target_point_cm_value.setText(_format_vec_cm(self._target_robot_point_m))
-            self.move_target_point_m_value.setText(_format_vec_m(self._target_robot_point_m))
         corrected_target = apply_tcp_offset_correction(
             self._selected_robot_target_raw_m,
             self._tcp_offset,
             target_rpy,
         )
         self.target_point_cm_value.setText(_format_vec_cm(corrected_target))
-        self.target_point_m_value.setText(_format_vec_m(corrected_target))
         self._update_move_button_state()
-
-    def _update_transform_summary(self):
-        if not hasattr(self, "transform_summary"):
-            return
-        matrix_text = np.array2string(
-            CAMERA_TO_ROBOT_MATRIX,
-            precision=3,
-            suppress_small=True,
-            separator=", ",
-        )
-        self.transform_summary.setText(
-            tr(
-                "pc.transform_summary",
-                path=str(CAMERA_TO_ROBOT_CONFIG_PATH),
-                matrix=matrix_text,
-            )
-        )
 
     def _apply_initial_view(self):
         if not HAS_PYVISTA or self._plotter is None:
@@ -1118,6 +1663,350 @@ class RealSensePointPanel(QWidget):
         self.status_label.setText(tr("pc.movel_sent"))
         self.log_message.emit(tr("pc.movel_sent"))
 
+    def _book_grasp_steps(self) -> list[str]:
+        return [
+            "采集点云",
+            "识别书籍",
+            "解算目标点",
+            "夹爪全开，MoveL 到 X 偏移位置，杆电机到零位",
+            "机械臂按 X 偏移继续移动",
+            "杆电机到夹取位",
+            "夹爪全关",
+            "机械臂回到第五步构型",
+            "机械臂回到调试位置",
+            "机械臂慢速转身到 -90 度构型",
+            "机械臂慢速转身到 -180 度构型",
+        ]
+
+    def _format_flow_steps_text(self) -> str:
+        return "\n".join(
+            f"{idx + 1}. {step}" for idx, step in enumerate(self._book_grasp_steps())
+        )
+
+    def _show_flow_steps_dialog(self):
+        QMessageBox.information(
+            self,
+            "完整书籍夹取流程",
+            self._format_flow_steps_text(),
+        )
+
+    def _reset_book_grasp_flow(self):
+        self._flow_active = False
+        self._flow_step_index = 0
+        self._flow_waiting_motion = False
+        self._flow_rollback_waiting = False
+        self._flow_pose_history.clear()
+        self._flow_approach_pose = None
+        self.flow_status_label.setText("流程未开始")
+        self.flow_target_label.setText("目标点: --")
+        self._update_flow_button_state()
+
+    def _execute_next_book_grasp_step(self):
+        if self._flow_waiting_motion:
+            return
+        if not self._flow_active:
+            self._flow_active = True
+            self._flow_step_index = 0
+        steps = self._book_grasp_steps()
+        if self._flow_step_index >= len(steps):
+            self._reset_book_grasp_flow()
+            return
+
+        step = self._flow_step_index
+        total = len(steps)
+        self.flow_status_label.setText(f"执行中 [{step + 1}/{total}] {steps[step]}")
+        self.log_message.emit(f"书籍夹取流程 [{step + 1}/{total}] {steps[step]}")
+
+        if step == 0:
+            self._start_capture()
+        elif step == 1:
+            self._detect_book_target()
+        elif step == 2:
+            self._solve_book_grasp_target()
+        elif step == 3:
+            self._execute_pregrasp_step()
+        elif step == 4:
+            self._execute_approach_step()
+        elif step == 5:
+            self._write_rod_and_wait(self.rod_grasp_spin.value())
+        elif step == 6:
+            self._send_gripper(self.gripper_close_spin.value(), self.DEFAULT_GRIPPER_HOLD_EFFORT_NM)
+            self._advance_book_grasp_flow("夹爪关闭命令已发送")
+        elif step == 7:
+            self._execute_return_approach_step()
+        elif step == 8:
+            self._execute_return_debug_step()
+        elif step == 9:
+            self._execute_turn_stage1_step()
+        elif step == 10:
+            self._execute_turn_stage2_step()
+
+    def _solve_book_grasp_target(self):
+        if self._target_robot_point_m is None:
+            self._set_error("请先识别书籍或手动选中目标点")
+            return
+        self._recompute_target_from_selection()
+        self.flow_target_label.setText(
+            f"目标点: {_format_vec_cm(self._target_robot_point_m)}"
+        )
+        self._advance_book_grasp_flow(
+            f"目标点已解算: {_format_vec_cm(self._target_robot_point_m)}"
+        )
+
+    def _execute_pregrasp_step(self):
+        if self._target_robot_point_m is None:
+            self._set_error("没有目标点，无法执行预抓取")
+            return
+        self._set_grasp_rpy()
+        self._send_gripper(self.gripper_open_spin.value(), 0.0)
+        self._ensure_rod_connected()
+        self.rod_write_requested.emit(
+            self.rod_zero_spin.value(),
+            self.rod_speed_spin.value(),
+            self.rod_acc_spin.value(),
+            self.rod_torque_spin.value(),
+        )
+        pose = self._make_target_pose_with_x_offset(self.pregrasp_x_offset_spin.value())
+        self._send_blocking_movel(pose, "等待机械臂到达预抓取位置")
+
+    def _execute_approach_step(self):
+        if self._target_robot_point_m is None:
+            self._set_error("没有目标点，无法执行夹取移动")
+            return
+        self._set_grasp_rpy()
+        total_offset_cm = self.pregrasp_x_offset_spin.value() + self.approach_x_delta_spin.value()
+        pose = self._make_target_pose_with_x_offset(total_offset_cm)
+        self._flow_approach_pose = [float(value) for value in pose]
+        self._send_blocking_movel(pose, "等待机械臂完成 X 方向移动")
+
+    def _set_grasp_rpy(self):
+        for spin, value in zip(self.rpy_spins, self.DEFAULT_GRASP_RPY_DEG):
+            blocker = QSignalBlocker(spin)
+            spin.setValue(float(value))
+            del blocker
+        self._rpy_initialized = True
+        if self._selected_robot_target_raw_m is not None:
+            self._recompute_target_from_selection()
+
+    def _execute_return_debug_step(self):
+        joints = [math.radians(value) for value in self.DEFAULT_DEBUG_JOINTS_DEG]
+        self._record_previous_flow_pose()
+        self._flow_waiting_motion = True
+        self._update_flow_button_state()
+        self.flow_status_label.setText(
+            "等待机械臂 MoveJ 回到调试构型 [0, 35, -45, 0, 0, 0]"
+        )
+        self.move_j_block_requested.emit(
+            joints,
+            float(self.flow_debug_duration_spin.value()),
+        )
+
+    def _execute_turn_stage1_step(self):
+        self._send_slow_turn_movej(
+            self.DEFAULT_TURN_STAGE1_JOINTS_DEG,
+            "等待机械臂慢速转身到 [-90, 35, -40, 0, 0, 0]",
+        )
+
+    def _execute_turn_stage2_step(self):
+        self._send_slow_turn_movej(
+            self.DEFAULT_TURN_STAGE2_JOINTS_DEG,
+            "等待机械臂慢速转身到 [-180, 35, -40, 0, 0, 0]",
+        )
+
+    def _send_slow_turn_movej(self, joints_deg: Sequence[float], waiting_text: str):
+        joints = [math.radians(float(value)) for value in joints_deg]
+        self._record_previous_flow_pose()
+        self._flow_waiting_motion = True
+        self._update_flow_button_state()
+        self.flow_status_label.setText(waiting_text)
+        self.move_j_block_requested.emit(
+            joints,
+            float(self.flow_turn_duration_spin.value()),
+        )
+
+    def _execute_return_approach_step(self):
+        pose = self._flow_approach_pose
+        if pose is None:
+            self._set_error("没有记录到第五步构型，无法回退")
+            return
+        self._record_previous_flow_pose()
+        self._flow_waiting_motion = True
+        self._update_flow_button_state()
+        self.flow_status_label.setText("等待机械臂回到第五步构型")
+        self.move_l_block_requested.emit(
+            [float(value) for value in pose],
+            float(self.flow_movel_duration_spin.value()),
+        )
+
+    def _pose_from_current_end_pose(self) -> Optional[list[float]]:
+        pose = self._current_end_pose
+        if pose is None:
+            return None
+        return [
+            float(pose.x),
+            float(pose.y),
+            float(pose.z),
+            float(pose.rx),
+            float(pose.ry),
+            float(pose.rz),
+        ]
+
+    def _make_target_pose_with_x_offset(self, x_offset_cm: float) -> list[float]:
+        target = np.asarray(self._target_robot_point_m, dtype=float).reshape(3).copy()
+        target[0] += float(x_offset_cm) / M_TO_CM
+        target[1] += float(self.target_y_offset_spin.value()) / M_TO_CM
+        target[2] += float(self.target_z_offset_spin.value()) / M_TO_CM
+        return [
+            float(target[0]),
+            float(target[1]),
+            float(target[2]),
+            math.radians(self.rpy_spins[0].value()),
+            math.radians(self.rpy_spins[1].value()),
+            math.radians(self.rpy_spins[2].value()),
+        ]
+
+    def _send_blocking_movel(self, pose: list[float], waiting_text: str):
+        self._record_previous_flow_pose()
+        self._flow_waiting_motion = True
+        self._update_flow_button_state()
+        self.flow_status_label.setText(waiting_text)
+        self.move_l_block_requested.emit(pose, float(self.flow_movel_duration_spin.value()))
+
+    def _record_previous_flow_pose(self):
+        current_pose = self._pose_from_current_end_pose()
+        if current_pose is None:
+            return
+        step = self._flow_step_index
+        steps = self._book_grasp_steps()
+        label = steps[step - 1] if 0 < step <= len(steps) else "当前位置"
+        self._flow_pose_history.append((step, label, current_pose))
+        if len(self._flow_pose_history) > 16:
+            self._flow_pose_history = self._flow_pose_history[-16:]
+
+    def _rollback_to_previous_flow_pose(self):
+        if self._flow_waiting_motion:
+            return
+        if not self._flow_pose_history:
+            self.flow_status_label.setText("没有可回退的位置")
+            return
+        step, label, pose = self._flow_pose_history.pop()
+        self._flow_active = True
+        self._flow_step_index = max(0, min(step, len(self._book_grasp_steps()) - 1))
+        self._flow_waiting_motion = True
+        self._flow_rollback_waiting = True
+        self._update_flow_button_state()
+        self.flow_status_label.setText(f"正在回退到上一步位置：{label}")
+        self.log_message.emit(f"书籍夹取流程回退到上一步位置: {label}")
+        self.move_l_block_requested.emit(
+            [float(value) for value in pose],
+            float(self.flow_movel_duration_spin.value()),
+        )
+
+    def _send_gripper(self, angle_deg: float, effort: float):
+        self.gripper_requested.emit(
+            math.radians(float(angle_deg)),
+            float(effort),
+            self.DEFAULT_GRIPPER_KP if effort > 0.0 else 0.0,
+            self.DEFAULT_GRIPPER_KD if effort > 0.0 else 0.0,
+        )
+
+    def _ensure_rod_connected(self):
+        if self._rod_connected:
+            return
+        port = self.rod_port_edit.text().strip() or self.DEFAULT_ROD_PORT
+        self.rod_connect_requested.emit(
+            port,
+            self.rod_baud_spin.value(),
+            self.rod_timeout_spin.value(),
+        )
+
+    def _write_rod_and_wait(self, angle_deg: float):
+        self._ensure_rod_connected()
+        self._flow_waiting_motion = True
+        self._update_flow_button_state()
+        self.flow_status_label.setText("等待杆电机动作命令发送完成")
+        self.rod_write_requested.emit(
+            float(angle_deg),
+            self.rod_speed_spin.value(),
+            self.rod_acc_spin.value(),
+            self.rod_torque_spin.value(),
+        )
+
+    def _advance_book_grasp_flow(self, message: str):
+        if not self._flow_active:
+            return
+        self._flow_waiting_motion = False
+        self._flow_step_index += 1
+        if self._flow_step_index >= len(self._book_grasp_steps()):
+            self.flow_status_label.setText(f"流程完成：{message}")
+            self.log_message.emit("书籍夹取流程完成")
+        else:
+            next_step = self._book_grasp_steps()[self._flow_step_index]
+            self.flow_status_label.setText(
+                f"{message}。请确认后执行 [{self._flow_step_index + 1}/{len(self._book_grasp_steps())}] {next_step}"
+            )
+        self._update_flow_button_state()
+
+    def notify_move_l_done(self):
+        if self._flow_active and self._flow_rollback_waiting:
+            self._flow_waiting_motion = False
+            self._flow_rollback_waiting = False
+            next_step = self._book_grasp_steps()[self._flow_step_index]
+            self.flow_status_label.setText(
+                f"已回退到上一步位置。请确认后执行 [{self._flow_step_index + 1}/{len(self._book_grasp_steps())}] {next_step}"
+            )
+            self._update_flow_button_state()
+            return
+        if self._flow_active and self._flow_waiting_motion:
+            self._advance_book_grasp_flow("机械臂运动完成")
+
+    def notify_move_j_done(self):
+        if self._flow_active and self._flow_waiting_motion:
+            if self._flow_step_index == 7:
+                self._advance_book_grasp_flow("机械臂已回到第五步构型")
+            elif self._flow_step_index == 8:
+                self._advance_book_grasp_flow("机械臂已回到调试构型")
+            elif self._flow_step_index == 9:
+                self._advance_book_grasp_flow("机械臂已转身到 -90 度构型")
+            elif self._flow_step_index == 10:
+                self._advance_book_grasp_flow("机械臂已转身到 -180 度构型")
+
+    def notify_rod_write_done(self):
+        if self._flow_active and self._flow_waiting_motion and self._flow_step_index == 5:
+            self._advance_book_grasp_flow("杆电机夹取位命令已发送")
+
+    def notify_flow_error(self, message: str):
+        if not self._flow_active:
+            return
+        self._flow_waiting_motion = False
+        self._flow_rollback_waiting = False
+        current = min(self._flow_step_index + 1, len(self._book_grasp_steps()))
+        self.flow_status_label.setText(f"第 {current} 步出错，可调整后重试：{message}")
+        self._update_flow_button_state()
+
+    def set_rod_connected(self, connected: bool):
+        self._rod_connected = bool(connected)
+        self._update_flow_button_state()
+
+    def _update_flow_button_state(self):
+        if not hasattr(self, "flow_next_btn"):
+            return
+        completed = self._flow_active and self._flow_step_index >= len(self._book_grasp_steps())
+        can_step = self._arm_enabled and not self._flow_waiting_motion
+        self.flow_next_btn.setEnabled(can_step)
+        if hasattr(self, "flow_back_btn"):
+            self.flow_back_btn.setEnabled(
+                self._arm_enabled
+                and not self._flow_waiting_motion
+                and bool(self._flow_pose_history)
+            )
+        if completed:
+            self.flow_next_btn.setText("流程完成，点击重置")
+        elif not self._flow_active:
+            self.flow_next_btn.setText("开始/执行下一步")
+        else:
+            self.flow_next_btn.setText(f"确认执行第 {self._flow_step_index + 1} 步")
+
     def _clear_selection(self, keep_result: bool = False):
         if not keep_result:
             self._selected_display_index = None
@@ -1127,11 +2016,8 @@ class RealSensePointPanel(QWidget):
             self._selected_robot_target_raw_m = None
             self._target_robot_point_m = None
             self.pixel_value.setText("--")
-            self.camera_point_value.setText("--")
             self.move_target_point_cm_value.setText("--")
-            self.move_target_point_m_value.setText("--")
             self.target_point_cm_value.setText("--")
-            self.target_point_m_value.setText("--")
         if self._selected_actor is not None and self._plotter is not None:
             try:
                 self._plotter.remove_actor(self._selected_actor)
@@ -1145,6 +2031,7 @@ class RealSensePointPanel(QWidget):
         can_move = self._arm_enabled and self._target_robot_point_m is not None
         if hasattr(self, "move_btn"):
             self.move_btn.setEnabled(can_move)
+        self._update_flow_button_state()
 
     def _set_error(self, message: str):
         self.status_label.setText(message)
@@ -1169,34 +2056,22 @@ class RealSensePointPanel(QWidget):
 
     def retranslate_ui(self):
         self.capture_group.setTitle(tr("pc.capture_group"))
-        self.serial_label.setText(tr("pc.serial"))
-        self.serial_edit.setPlaceholderText(tr("pc.serial_placeholder"))
-        self.width_label.setText(tr("pc.width"))
-        self.height_label.setText(tr("pc.height"))
-        self.fps_label.setText(tr("pc.fps"))
-        self.warmup_label.setText(tr("pc.warmup"))
-        self.timeout_label.setText(tr("pc.timeout"))
-        self.depth_min_label.setText(tr("pc.depth_min"))
-        self.depth_max_label.setText(tr("pc.depth_max"))
-        self.stride_label.setText(tr("pc.stride"))
-        self.max_points_label.setText(tr("pc.max_points"))
-        self.point_size_label.setText(tr("pc.point_size"))
-        self.align_check.setText(tr("pc.align_depth"))
-        self.color_check.setText(tr("pc.use_color"))
-        self.flip_view_check.setText(tr("pc.flip_view"))
         self.pick_mode_btn.setText(tr("pc.pick_mode"))
         self.capture_btn.setText(tr("pc.capture"))
-
-        self.transform_group.setTitle(tr("pc.transform_group"))
-        self._update_transform_summary()
+        self.book_group.setTitle(tr("pc.book_group"))
+        for idx, (label, path) in enumerate(BOOK_TEMPLATE_OPTIONS):
+            if idx < self.template_combo.count():
+                self.template_combo.setItemText(idx, label)
+                self.template_combo.setItemData(idx, str(path))
+        if hasattr(self, "flow_detect_btn"):
+            self.flow_detect_btn.setText(tr("pc.book_detect"))
+        if self._frame is None:
+            self.book_status_label.setText(tr("pc.book_ready"))
 
         self.result_group.setTitle(tr("pc.result_group"))
         self.pixel_label.setText(tr("pc.pixel"))
-        self.camera_point_label.setText(tr("pc.camera_point"))
         self.robot_point_cm_label.setText(tr("pc.move_target_point_cm"))
-        self.robot_point_m_label.setText(tr("pc.move_target_point_m"))
         self.target_point_cm_label.setText(tr("pc.target_point_cm"))
-        self.target_point_m_label.setText(tr("pc.target_point_m"))
         self.move_group.setTitle(tr("pc.move_group"))
         for label, key in zip(self.rpy_labels, ("pc.rx", "pc.ry", "pc.rz")):
             label.setText(tr(key))

@@ -10,9 +10,10 @@ from typing import List, Sequence
 
 
 # Internal SDK order maps to MotorStudio UI as X=offset[2], Y=offset[0], Z=offset[1].
-DEFAULT_TCP_OFFSET = [0.0, 0.05, -0.14, 0.0, 0.0, 0.0]
+PREVIOUS_DEFAULT_TCP_OFFSET = [0.0, 0.05, -0.14, 0.0, 0.0, 0.0]
+DEFAULT_TCP_OFFSET = [0.0, -0.01, -0.14, 0.0, 0.0, 0.0]
 LEGACY_ZERO_TCP_OFFSET = [0.0] * 6
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 
 def _config_dir() -> Path:
@@ -70,6 +71,13 @@ def load_tcp_offset(default: Sequence[float] | None = None) -> List[float]:
         and isinstance(payload, dict)
         and "version" not in payload
         and _is_same_offset(normalized, LEGACY_ZERO_TCP_OFFSET)
+    ):
+        return fallback
+    if (
+        default is None
+        and isinstance(payload, dict)
+        and int(payload.get("version", 0) or 0) < CONFIG_VERSION
+        and _is_same_offset(normalized, PREVIOUS_DEFAULT_TCP_OFFSET)
     ):
         return fallback
     return normalized

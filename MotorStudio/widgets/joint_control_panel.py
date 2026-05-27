@@ -11,15 +11,11 @@ from PyQt6.QtCore import pyqtSignal, Qt
 from MotorStudio.utils.style import JOINT_COLORS, SCENE_COLORS
 from MotorStudio.utils.theme_manager import ThemeManager
 from MotorStudio.utils.i18n import tr
+from el_a3_sdk.protocol import DEFAULT_JOINT_LIMITS
 
 JOINT_LIMITS_DEG = {
-    1: (-160.0, 160.0),
-    2: (0.0, 210.0),
-    3: (-230.0, 0.0),
-    4: (-90.0, 90.0),
-    5: (-90.0, 90.0),
-    6: (-90.0, 90.0),
-    7: (-90.0, 90.0),
+    joint_id: (math.degrees(lo), math.degrees(hi))
+    for joint_id, (lo, hi) in DEFAULT_JOINT_LIMITS.items()
 }
 
 JOINT_NAMES = ["L1", "L2", "L3", "L4", "L5", "L6", "L7"]

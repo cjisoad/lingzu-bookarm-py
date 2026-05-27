@@ -82,6 +82,24 @@ QTabBar::tab:selected {{
 }}
 QTabBar::tab:hover:!selected {{ color: #cdd6f4; background-color: #1f2037; }}
 
+QPushButton#panelTabButton {{
+    background-color: #16172a;
+    color: #8b8fa8;
+    border: 1px solid #2a2b40;
+    border-radius: 6px;
+    padding: 5px 8px;
+    min-height: 24px;
+}}
+QPushButton#panelTabButton:checked {{
+    background-color: #1f2037;
+    color: #89b4fa;
+    border-color: #89b4fa;
+}}
+QPushButton#panelTabButton:hover:!checked {{
+    color: #cdd6f4;
+    background-color: #202238;
+}}
+
 /* ── 按钮 ── */
 QPushButton {{
     background-color: #282a40;
@@ -415,6 +433,24 @@ QTabBar::tab:selected {{
     border-bottom: 2px solid #3478f6;
 }}
 QTabBar::tab:hover:!selected {{ color: #1d1d2e; background-color: #e8eaf2; }}
+
+QPushButton#panelTabButton {{
+    background-color: #eef0f5;
+    color: #6b7084;
+    border: 1px solid #d8dbe5;
+    border-radius: 6px;
+    padding: 5px 8px;
+    min-height: 24px;
+}}
+QPushButton#panelTabButton:checked {{
+    background-color: #ffffff;
+    color: #3478f6;
+    border-color: #3478f6;
+}}
+QPushButton#panelTabButton:hover:!checked {{
+    color: #1d1d2e;
+    background-color: #e8eaf2;
+}}
 
 /* ── 按钮 ── */
 QPushButton {{

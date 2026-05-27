@@ -15,8 +15,6 @@ import threading
 import logging
 from typing import Dict, Optional, Callable
 
-import serial
-
 from el_a3_sdk.protocol import (
     CommType, MotorType, RunMode, MotorParams, ParamIndex,
     MOTOR_PARAMS, DEFAULT_MOTOR_TYPE_MAP,
@@ -25,9 +23,11 @@ from el_a3_sdk.data_types import (
     MotorFeedback, ParamReadResult, FirmwareVersion,
 )
 from el_a3_sdk.drivers.timing import busy_wait_us
+from el_a3_sdk.serial_utils import load_pyserial
 from el_a3_sdk.utils import float_to_uint16, uint16_to_float
 
 logger = logging.getLogger("el_a3_sdk.drivers.slcan")
+serial = load_pyserial()
 
 CAN_EFF_MASK = 0x1FFFFFFF
 

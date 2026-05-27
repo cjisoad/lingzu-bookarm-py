@@ -9,6 +9,7 @@ from el_a3_sdk.data_types import (
     DynamicsInfo,
     TrajectoryResult,
 )
+from el_a3_sdk.rodmotor import RodMotorClient
 from el_a3_sdk.protocol import (
     MotorType,
     RunMode,
@@ -130,4 +131,5 @@ __all__ = [
     "update_stable_state",
     "SelectedPoint",
     "SelectedTarget",
+    "RodMotorClient",
 ]

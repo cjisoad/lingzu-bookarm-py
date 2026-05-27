@@ -11,6 +11,7 @@ from PyQt6.QtCore import pyqtSignal, Qt
 from MotorStudio.utils.i18n import tr
 from MotorStudio.utils.theme_manager import ThemeManager
 from MotorStudio.utils.style import SCENE_COLORS
+from el_a3_sdk.protocol import DEFAULT_JOINT_LIMITS
 
 JOINT_NAMES_ORDERED = [
     "L1_joint", "L2_joint", "L3_joint",
@@ -22,6 +23,7 @@ CM_TO_M = 0.01
 
 MOVEL_DEBUG_JOINTS_DEG = [0.0, 35.0, -35.0, 0.0, -20.0, 0.0]
 MOVEL_DEBUG_POSE = [-15.0, 0.0, 25.0, 90.0, 0.0, 90.0]
+MOVEJ_DEBUG_JOINTS_DEG = [0.0, 35.0, -45.0, 0.0, 0.0, 0.0]
 
 
 class TrajectoryPanel(QWidget):
@@ -101,11 +103,11 @@ class TrajectoryPanel(QWidget):
         grid = QGridLayout()
         self._movej_spins = []
         joint_names = ["L1", "L2", "L3", "L4", "L5", "L6"]
-        limits = [(-160, 160), (0, 210), (-230, 0), (-90, 90), (-90, 90), (-90, 90)]
         for i in range(6):
             grid.addWidget(QLabel(joint_names[i]), i // 3, (i % 3) * 2)
             spin = QDoubleSpinBox()
-            lo, hi = limits[i]
+            lo_rad, hi_rad = DEFAULT_JOINT_LIMITS[i + 1]
+            lo, hi = math.degrees(lo_rad), math.degrees(hi_rad)
             spin.setRange(lo, hi)
             spin.setDecimals(2)
             spin.setSuffix("°")
@@ -131,6 +133,14 @@ class TrajectoryPanel(QWidget):
         self.movej_exec_btn.clicked.connect(self._on_exec_movej)
         dur_layout.addWidget(self.movej_exec_btn)
         layout.addLayout(dur_layout)
+
+        debug_layout = QHBoxLayout()
+        self.movej_debug_btn = QPushButton(tr("traj.move_debug"))
+        self.movej_debug_btn.setToolTip("MoveJ to [0, 35, -35, 0, 0, 0]")
+        self.movej_debug_btn.clicked.connect(self._movej_to_debug_pose)
+        debug_layout.addWidget(self.movej_debug_btn)
+        debug_layout.addStretch()
+        layout.addLayout(debug_layout)
 
         layout.addStretch()
         return w
@@ -268,6 +278,8 @@ class TrajectoryPanel(QWidget):
         self.movej_group.setTitle(tr("traj.joint_target"))
         self.movej_dur_label.setText(tr("traj.duration"))
         self.movej_exec_btn.setText(tr("traj.exec_movej"))
+        self.movej_debug_btn.setText(tr("traj.move_debug"))
+        self.movej_debug_btn.setToolTip("MoveJ to [0, 35, -35, 0, 0, 0]")
         self.movel_group.setTitle(tr("traj.cart_target"))
         self.read_pose_btn.setText(tr("traj.read_pose"))
         self.read_pose_btn.setToolTip(tr("traj.read_pose_tip"))
@@ -298,6 +310,15 @@ class TrajectoryPanel(QWidget):
     def _on_exec_movej(self):
         positions = [math.radians(s.value()) for s in self._movej_spins]
         duration = self.movej_duration.value()
+        self.move_j_requested.emit(positions, duration)
+        self._status_mode = "movej"
+        self.status_label.setText(tr("traj.movej_running"))
+
+    def _movej_to_debug_pose(self):
+        positions = [math.radians(v) for v in MOVEJ_DEBUG_JOINTS_DEG]
+        duration = max(2.0, self.movej_duration.value())
+        for spin, value in zip(self._movej_spins, MOVEJ_DEBUG_JOINTS_DEG):
+            spin.setValue(value)
         self.move_j_requested.emit(positions, duration)
         self._status_mode = "movej"
         self.status_label.setText(tr("traj.movej_running"))

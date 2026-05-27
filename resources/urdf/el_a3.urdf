@@ -201,7 +201,7 @@
     <parent link="l1_urdf_urdf_asm"/>
     <child link="l1_link_urdf_asm"/>
     <axis xyz="0 0 -1"/>
-    <limit effort="14" lower="-2.79253" upper="2.79253" velocity="33"/>
+    <limit effort="14" lower="-4.71239" upper="4.71239" velocity="33"/>
     <dynamics damping="0.1" friction="0.1"/>
   </joint>
   <!-- Joint L2 (RS00 Motor 2) -->
@@ -335,8 +335,8 @@
       <param name="position_offset">0.0</param>
       <param name="direction">-1.0</param>
       <command_interface name="position">
-        <param name="min">-2.79253</param>
-        <param name="max">2.79253</param>
+        <param name="min">-4.71239</param>
+        <param name="max">4.71239</param>
       </command_interface>
       <command_interface name="velocity">
         <param name="min">-33.0</param>

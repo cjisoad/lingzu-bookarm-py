@@ -397,9 +397,13 @@ class RealSenseD435:
         fps: int = 30,
         serial: Optional[str] = None,
         align_depth_to_color: bool = True,
+        depth_width: Optional[int] = None,
+        depth_height: Optional[int] = None,
     ) -> None:
         self.width = width
         self.height = height
+        self.depth_width = int(depth_width if depth_width is not None else width)
+        self.depth_height = int(depth_height if depth_height is not None else height)
         self.fps = fps
         self.serial = serial
         self.align_depth_to_color = align_depth_to_color
@@ -412,8 +416,8 @@ class RealSenseD435:
 
         self._config.enable_stream(
             self._rs.stream.depth,
-            width,
-            height,
+            self.depth_width,
+            self.depth_height,
             self._rs.format.z16,
             fps,
         )
@@ -447,7 +451,18 @@ class RealSenseD435:
         if self._profile is not None:
             return
 
-        self._profile = self._pipeline.start(self._config)
+        try:
+            self._profile = self._pipeline.start(self._config)
+        except Exception as exc:
+            message = str(exc)
+            if "Couldn't resolve requests" in message:
+                raise RuntimeError(
+                    "RealSense 不支持当前 RGB-D 流配置："
+                    f"color={self.width}x{self.height}@{self.fps}, "
+                    f"depth={self.depth_width}x{self.depth_height}@{self.fps}。"
+                    "请改用相机同时支持的深度和彩色分辨率。"
+                ) from exc
+            raise
         depth_sensor = self._profile.get_device().first_depth_sensor()
         self._depth_scale = float(depth_sensor.get_depth_scale())
 

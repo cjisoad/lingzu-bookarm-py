@@ -3,12 +3,14 @@
 import time
 import logging
 from PyQt6.QtWidgets import (
-    QMainWindow, QDockWidget, QTabWidget, QStackedWidget,
-    QWidget, QTextEdit,
+    QMainWindow, QDockWidget, QStackedWidget,
+    QWidget, QTextEdit, QPushButton, QGridLayout, QVBoxLayout,
+    QButtonGroup,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
 from MotorStudio.backend.arm_worker import ArmWorker
+from MotorStudio.backend.rodmotor_worker import RodMotorWorker
 from MotorStudio.widgets.toolbar_panel import ToolbarPanel
 from MotorStudio.widgets.joint_control_panel import JointControlPanel
 from MotorStudio.widgets.monitoring_window import MonitoringWindow
@@ -17,6 +19,7 @@ from MotorStudio.widgets.tcp_panel import TcpPanel
 from MotorStudio.widgets.teaching_panel import TeachingPanel
 from MotorStudio.widgets.diagnostics_panel import DiagnosticsPanel
 from MotorStudio.widgets.gripper_panel import GripperPanel
+from MotorStudio.widgets.rodmotor_panel import RodMotorPanel
 from MotorStudio.widgets.gamepad_panel import GamepadPanel
 from MotorStudio.widgets.realsense_point_panel import RealSensePointPanel
 from MotorStudio.widgets.viewer_3d import Viewer3DPanel
@@ -24,6 +27,83 @@ from MotorStudio.utils.i18n import tr
 from MotorStudio.utils.theme_manager import ThemeManager
 
 logger = logging.getLogger("MotorStudio")
+
+
+class MultiRowPanelTabs(QWidget):
+    """Compact two-row navigation for the right-side function panels."""
+
+    currentChanged = pyqtSignal(int)
+
+    def __init__(self, parent=None, columns: int = 5):
+        super().__init__(parent)
+        self._columns = max(1, int(columns))
+        self._buttons: list[QPushButton] = []
+        self._pages: list[QWidget] = []
+        self._button_group = QButtonGroup(self)
+        self._button_group.setExclusive(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._nav_widget = QWidget(self)
+        self._nav_layout = QGridLayout(self._nav_widget)
+        self._nav_layout.setContentsMargins(4, 4, 4, 0)
+        self._nav_layout.setHorizontalSpacing(4)
+        self._nav_layout.setVerticalSpacing(4)
+        layout.addWidget(self._nav_widget)
+
+        self._stack = QStackedWidget(self)
+        layout.addWidget(self._stack, 1)
+
+    def addTab(self, widget: QWidget, label: str) -> int:
+        index = len(self._pages)
+        self._pages.append(widget)
+        self._stack.addWidget(widget)
+
+        button = QPushButton(label, self)
+        button.setCheckable(True)
+        button.setMinimumHeight(30)
+        button.setObjectName("panelTabButton")
+        self._buttons.append(button)
+        self._button_group.addButton(button, index)
+        button.clicked.connect(lambda _checked=False, i=index: self.setCurrentIndex(i))
+        self._place_button(index, button)
+
+        if index == 0:
+            button.setChecked(True)
+            self._stack.setCurrentIndex(0)
+        return index
+
+    def indexOf(self, widget: QWidget) -> int:
+        try:
+            return self._pages.index(widget)
+        except ValueError:
+            return -1
+
+    def currentIndex(self) -> int:
+        return self._stack.currentIndex()
+
+    def setCurrentIndex(self, index: int):
+        if index < 0 or index >= len(self._pages):
+            return
+        if index == self._stack.currentIndex():
+            self._buttons[index].setChecked(True)
+            return
+        self._stack.setCurrentIndex(index)
+        self._buttons[index].setChecked(True)
+        self.currentChanged.emit(index)
+
+    def setTabText(self, index: int, text: str):
+        if 0 <= index < len(self._buttons):
+            self._buttons[index].setText(text)
+
+    def _place_button(self, index: int, button: QPushButton):
+        row = index // self._columns
+        col = index % self._columns
+        self._nav_layout.addWidget(button, row, col)
+        for c in range(self._columns):
+            self._nav_layout.setColumnStretch(c, 1)
 
 
 class MainWindow(QMainWindow):
@@ -56,6 +136,7 @@ class MainWindow(QMainWindow):
         )
         tm.theme_changed.connect(lambda _: self.diagnostics_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.gripper_panel.retranslate_ui())
+        tm.theme_changed.connect(lambda _: self.rodmotor_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.gamepad_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.tcp_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.point_cloud_panel.apply_theme())
@@ -67,6 +148,8 @@ class MainWindow(QMainWindow):
     def _init_worker(self):
         self.worker = ArmWorker()
         self.worker.start()
+        self.rodmotor_worker = RodMotorWorker()
+        self.rodmotor_worker.start()
 
     def _init_ui(self):
         # --- 顶部工具栏（单行固定高度） ---
@@ -95,8 +178,8 @@ class MainWindow(QMainWindow):
         self.viewer_dock.setTitleBarWidget(_hide)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.viewer_dock)
 
-        # --- 右侧：功能面板 Tab ---
-        self.tabs = QTabWidget()
+        # --- 右侧：功能面板导航 ---
+        self.tabs = MultiRowPanelTabs(columns=5)
 
         self.joint_panel = JointControlPanel()
         self.tabs.addTab(self.joint_panel, tr("tab.joint"))
@@ -120,6 +203,9 @@ class MainWindow(QMainWindow):
 
         self.gripper_panel = GripperPanel()
         self.tabs.addTab(self.gripper_panel, tr("tab.gripper"))
+
+        self.rodmotor_panel = RodMotorPanel()
+        self.tabs.addTab(self.rodmotor_panel, tr("tab.rodmotor"))
 
         self.gamepad_panel = GamepadPanel()
         self.tabs.addTab(self.gamepad_panel, tr("tab.gamepad"))
@@ -223,6 +309,33 @@ class MainWindow(QMainWindow):
         pc.move_l_requested.connect(
             lambda pose, dur: self.worker.submit_command("move_l", pose, dur)
         )
+        pc.move_l_block_requested.connect(
+            lambda pose, dur: self.worker.submit_command("move_l_block", pose, dur)
+        )
+        pc.move_j_block_requested.connect(
+            lambda joints, dur: self.worker.submit_command("move_j_block", joints, dur)
+        )
+        pc.gripper_requested.connect(
+            lambda angle, effort, kp, kd: self.worker.submit_command(
+                "gripper_ctrl", angle, effort, kp, kd
+            )
+        )
+        pc.rod_connect_requested.connect(
+            lambda port, baud, timeout: self.rodmotor_worker.submit_command(
+                "connect", port, baud, timeout
+            )
+        )
+        pc.rod_write_requested.connect(
+            lambda angle, spd, acc, torque: self.rodmotor_worker.submit_command(
+                "write_angle", angle, spd, acc, torque
+            )
+        )
+        self.worker.move_l_done.connect(pc.notify_move_l_done)
+        self.worker.move_j_done.connect(pc.notify_move_j_done)
+        self.rodmotor_worker.connected_changed.connect(pc.set_rod_connected)
+        self.rodmotor_worker.write_done.connect(pc.notify_rod_write_done)
+        self.worker.error_occurred.connect(pc.notify_flow_error)
+        self.rodmotor_worker.error_occurred.connect(pc.notify_flow_error)
         pc.log_message.connect(self._append_log)
         pc.error_occurred.connect(self._on_error)
 
@@ -236,14 +349,40 @@ class MainWindow(QMainWindow):
         teach.move_j_requested.connect(
             lambda pos, dur: self.worker.submit_command("move_j", pos, dur)
         )
+        teach.trajectory_playback_requested.connect(
+            lambda traj: self.worker.submit_command("play_recorded_trajectory", traj)
+        )
 
         gp = self.gripper_panel
         gp.gripper_command.connect(
-            lambda angle: self.worker.submit_command("gripper_ctrl", angle)
+            lambda angle, effort=0.0, kp=0.0, kd=0.0: self.worker.submit_command("gripper_ctrl", angle, effort, kp, kd)
         )
         gp.set_zero_requested.connect(
             lambda: self.worker.submit_command("set_zero_position", 7)
         )
+
+        rod = self.rodmotor_panel
+        rod.connect_requested.connect(
+            lambda port, baud, timeout: self.rodmotor_worker.submit_command(
+                "connect", port, baud, timeout
+            )
+        )
+        rod.disconnect_requested.connect(
+            lambda: self.rodmotor_worker.submit_command("disconnect")
+        )
+        rod.read_requested.connect(
+            lambda: self.rodmotor_worker.submit_command("read_angle")
+        )
+        rod.write_requested.connect(
+            lambda angle, spd, acc: self.rodmotor_worker.submit_command(
+                "write_angle", angle, spd, acc
+            )
+        )
+        self.rodmotor_worker.connected_changed.connect(rod.set_connected)
+        self.rodmotor_worker.angle_updated.connect(rod.update_angle)
+        self.rodmotor_worker.error_occurred.connect(rod.set_error)
+        self.rodmotor_worker.error_occurred.connect(self._on_error)
+        self.rodmotor_worker.log_message.connect(self._append_log)
 
         diag = self.diagnostics_panel
         diag.read_param_requested.connect(
@@ -306,11 +445,12 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(4, tr("tab.teaching"))
         self.tabs.setTabText(5, tr("tab.diagnostics"))
         self.tabs.setTabText(6, tr("tab.gripper"))
-        self.tabs.setTabText(7, tr("tab.gamepad"))
+        self.tabs.setTabText(7, tr("tab.rodmotor"))
+        self.tabs.setTabText(8, tr("tab.gamepad"))
 
         for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
                       self.tcp_panel, self.point_cloud_panel, self.teaching_panel,
-                      self.diagnostics_panel, self.gripper_panel,
+                      self.diagnostics_panel, self.gripper_panel, self.rodmotor_panel,
                       self.gamepad_panel, self.viewer_3d):
             if hasattr(panel, "retranslate_ui"):
                 panel.retranslate_ui()
@@ -429,4 +569,5 @@ class MainWindow(QMainWindow):
         if self.worker.is_connected:
             self.worker.submit_command("disconnect")
         self.worker.stop()
+        self.rodmotor_worker.stop()
         super().closeEvent(event)

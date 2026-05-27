@@ -48,6 +48,7 @@ class ArmWorker(QThread):
     zero_sta_verified = pyqtSignal(list)
     motor_scan_result = pyqtSignal(list)
     move_j_done = pyqtSignal()
+    move_l_done = pyqtSignal()
     tcp_offset_updated = pyqtSignal(object)
 
     def __init__(self, parent=None):
@@ -131,8 +132,12 @@ class ArmWorker(QThread):
             self._do_joint_ctrl(*args)
         elif cmd == "move_j":
             self._do_move_j(*args, **kwargs)
+        elif cmd == "play_recorded_trajectory":
+            self._do_play_recorded_trajectory(*args)
         elif cmd == "move_l":
             self._do_move_l(*args, **kwargs)
+        elif cmd == "move_l_block":
+            self._do_move_l(*args, block=True, **kwargs)
         elif cmd == "end_pose_ctrl":
             self._do_end_pose_ctrl(*args, **kwargs)
         elif cmd == "cancel_motion":
@@ -188,13 +193,21 @@ class ArmWorker(QThread):
             return
 
         if backend != "slcan":
-            from MotorStudio.utils.can_utils import get_can_state
+            from MotorStudio.utils.can_utils import get_can_state, setup_can_interface
             state = get_can_state(can_name)
             if state != "UP":
-                self.error_occurred.emit(
-                    f"CAN 接口 {can_name} 未开启（当前状态: {state}），请先在工具栏中开启"
+                self.log_message.emit(
+                    f"CAN 接口 {can_name} 当前状态: {state}，尝试按 {can_bitrate} bps 自动开启..."
                 )
-                return
+                ok, msg = setup_can_interface(can_name, can_bitrate)
+                if not ok:
+                    self.error_occurred.emit(
+                        f"CAN 接口 {can_name} 未开启（当前状态: {state}）。"
+                        f"自动开启失败: {msg}。"
+                        f"请手动执行: sudo ./scripts/setup_can.sh {can_name} {can_bitrate}"
+                    )
+                    return
+                self.log_message.emit(msg)
 
         try:
             if getattr(sys, "frozen", False):
@@ -214,7 +227,6 @@ class ArmWorker(QThread):
                 kwargs["urdf_path"] = str(default_urdf_path)
             kwargs["per_joint_kd_min"] = {4: 0.005, 5: 0.005, 6: 0.005, 7: 0.02}
             kwargs["per_joint_kd_max"] = {4: 0.10, 5: 0.05, 6: 0.05, 7: 0.10}
-            kwargs["gravity_joint_scale"] = {4: 2.0}
             if backend == "slcan":
                 kwargs["backend"] = "slcan"
                 kwargs["serial_port"] = serial_port or can_name
@@ -341,6 +353,29 @@ class ArmWorker(QThread):
             self.arm.MoveJ(positions, duration=duration, block=True)
             self.move_j_done.emit()
 
+    def _do_play_recorded_trajectory(self, trajectory):
+        points = getattr(trajectory, "points", None) or []
+        if len(points) < 2:
+            self.log_message.emit("示教轨迹点数不足，无法回放")
+            return
+
+        if self._sim_mode:
+            self._sim_target = list(points[-1].positions[:7]) + [0.0] * (7 - len(points[-1].positions))
+            self.log_message.emit(
+                f"示教轨迹回放（模拟）: {len(points)} 点，duration={trajectory.duration:.2f}s"
+            )
+            return
+
+        if self.arm and self._enabled:
+            self._ensure_control_loop()
+            ok = self.arm.PlayRecordedTrajectory(points, block=False)
+            if ok:
+                self.log_message.emit(
+                    f"示教轨迹回放中: {len(points)} 点，duration={trajectory.duration:.2f}s"
+                )
+            else:
+                self.error_occurred.emit("示教轨迹回放失败")
+
     def _do_move_l(self, target_pose, duration=2.0, block=False):
         target_pose = self._coerce_end_pose(target_pose)
         if target_pose is None:
@@ -353,12 +388,17 @@ class ArmWorker(QThread):
                 return
             self._sim_target = list(q_target[:6]) + [self._sim_target[6]]
             self.log_message.emit(f"MoveL 执行（模拟 IK）duration={duration}s")
+            if block:
+                time.sleep(min(float(duration), 2.0))
+                self.move_l_done.emit()
             return
         if self.arm and self._enabled:
             self._ensure_control_loop()
             ok = self.arm.MoveL(target_pose, duration=duration, block=block)
             if ok:
                 self.log_message.emit(f"MoveL 执行中 duration={duration}s")
+                if block:
+                    self.move_l_done.emit()
             else:
                 self.error_occurred.emit("MoveL 执行失败，请检查目标位姿是否可达")
 
@@ -385,7 +425,7 @@ class ArmWorker(QThread):
             self.arm.cancel_motion()
             self.log_message.emit("运动已取消")
 
-    _ZERO_TORQUE_KD = [0.05, 0.05, 0.05, 0.05, 0.0125, 0.0125, 0.05]
+    _ZERO_TORQUE_KD = [0.05, 0.05, 0.05, 0.0125, 0.0125, 0.0125, 0.05]
 
     def _do_zero_torque(self, enable):
         if self._sim_mode:
@@ -404,17 +444,22 @@ class ArmWorker(QThread):
             self.log_message.emit(f"重力补偿零力矩{state}（模拟）")
             return
         if self.arm:
+            if enable and self.arm.control_loop_running:
+                self.arm.stop_control_loop()
+                self.control_loop_changed.emit(False)
+                self.log_message.emit("控制循环已停止，切换到与 demo 一致的重力补偿零力矩")
             self.arm.ZeroTorqueModeWithGravity(
                 enable, kd=self._ZERO_TORQUE_KD, update_rate=100.0)
             state = "开启" if enable else "关闭"
             self.log_message.emit(f"重力补偿零力矩{state}")
 
-    def _do_gripper_ctrl(self, angle):
+    def _do_gripper_ctrl(self, angle, effort=0.0, kp=0.0, kd=0.0):
         if self._sim_mode:
             self._sim_target[6] = angle
             return
         if self.arm and self._enabled:
-            self.arm.GripperCtrl(angle)
+            self._ensure_control_loop()
+            self.arm.GripperCtrl(angle, gripper_effort=effort, kp=kp or None, kd=kd or None)
 
     def _do_set_zero(self, motor_num=0xFF):
         if self._sim_mode:

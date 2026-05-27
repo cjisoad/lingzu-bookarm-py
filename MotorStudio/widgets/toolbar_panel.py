@@ -391,7 +391,8 @@ class ToolbarPanel(QWidget):
                 self.connect_requested.emit(port, kwargs)
             else:
                 can_name = self._get_selected_can_name()
-                self.connect_requested.emit(can_name, {})
+                bitrate = self.bitrate_combo.currentData() or 1000000
+                self.connect_requested.emit(can_name, {"can_bitrate": bitrate})
         else:
             self.disconnect_requested.emit()
 

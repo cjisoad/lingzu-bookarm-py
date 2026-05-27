@@ -21,6 +21,7 @@ class TeachingPanel(QWidget):
     zero_torque_requested = pyqtSignal(bool)
     zero_torque_gravity_requested = pyqtSignal(bool)
     move_j_requested = pyqtSignal(list, float)  # positions, duration
+    trajectory_playback_requested = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -226,9 +227,7 @@ class TeachingPanel(QWidget):
         traj = self.recorder.trajectories[idx]
         if not traj.points:
             return
-        dt = 1.0 / max(traj.sample_rate_hz, 1.0)
-        for pt in traj.points:
-            self.move_j_requested.emit(pt.positions[:6], dt)
+        self.trajectory_playback_requested.emit(traj)
 
     def _save_trajectory(self):
         idx = self.traj_list.currentRow()

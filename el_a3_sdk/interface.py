@@ -233,7 +233,11 @@ class ELA3Interface:
         n = self.NUM_ARM_JOINTS
         self._target_positions = [0.0] * n
         self._target_gripper = 0.0
-        self._gripper_dirty = False
+        self._target_gripper_effort = 0.0
+        self._target_gripper_kp = self._position_kp
+        self._target_gripper_kd = self._position_kd
+        self._gripper_active = False
+        self._gripper_motion_mode = False
         self._smoothed_positions = [0.0] * n
         self._smoothed_velocities = [0.0] * n
         self._last_cmd_positions = [0.0] * n
@@ -420,10 +424,11 @@ class ELA3Interface:
 
         with self._cmd_lock:
             target_positions = list(self._target_positions)
-            gripper_dirty = self._gripper_dirty
+            gripper_active = self._gripper_active
             gripper_target = self._target_gripper
-            if gripper_dirty:
-                self._gripper_dirty = False
+            gripper_effort = self._target_gripper_effort
+            gripper_kp = self._target_gripper_kp
+            gripper_kd = self._target_gripper_kd
 
         with self._state_lock:
             zero_torque = self._zero_torque_mode
@@ -520,9 +525,16 @@ class ELA3Interface:
         self._last_cmd_positions = list(clamped_positions)
 
         # --- Gripper ---
-        if gripper_dirty and not zero_torque:
+        if gripper_active and not zero_torque:
             gripper_motor_id = 7
-            self._driver.set_position_pp(gripper_motor_id, gripper_target)
+            self._driver.send_motion_control(
+                gripper_motor_id,
+                gripper_target,
+                0.0,
+                gripper_kp,
+                gripper_kd,
+                gripper_effort,
+            )
 
     def _read_feedback_positions(self) -> List[float]:
         """读取所有臂关节的反馈位置（URDF 坐标系）"""
@@ -565,7 +577,11 @@ class ELA3Interface:
             self._gravity_input_positions = list(arm_feedback)
             self._target_velocities = [0.0] * self.NUM_ARM_JOINTS
             self._target_gripper = gripper_feedback
-            self._gripper_dirty = False
+            self._target_gripper_effort = 0.0
+            self._target_gripper_kp = self._position_kp
+            self._target_gripper_kd = self._position_kd
+            self._gripper_active = False
+            self._gripper_motion_mode = False
 
         with self._state_lock:
             self._first_command = True
@@ -653,6 +669,7 @@ class ELA3Interface:
             with self._state_lock:
                 self._state = ArmState.ENABLED
                 self._first_command = True
+            self._gripper_motion_mode = False
         return success
 
     def DisableArm(self, motor_num: int = 0xFF) -> bool:
@@ -673,6 +690,7 @@ class ELA3Interface:
             with self._state_lock:
                 self._state = ArmState.IDLE
                 self._zero_torque_mode = False
+            self._gripper_motion_mode = False
         return success
 
     # ================================================================
@@ -693,6 +711,7 @@ class ELA3Interface:
         with self._state_lock:
             self._zero_torque_mode = False
             self._state = ArmState.IDLE
+        self._gripper_motion_mode = False
         logger.warning("急停已执行！所有电机已失能")
         return success
 
@@ -701,6 +720,7 @@ class ELA3Interface:
         success = self.EmergencyStop()
         self._ctrl_mode = ControlMode.STANDBY
         self._move_mode = MoveMode.MOVE_J
+        self._gripper_motion_mode = False
         with self._state_lock:
             self._state = ArmState.IDLE
         logger.info("机械臂已复位")
@@ -851,15 +871,39 @@ class ELA3Interface:
         if set_zero:
             return self._driver.set_zero_position(gripper_motor_id)
         if not gripper_enable:
+            self._gripper_motion_mode = False
             return self._driver.disable_motor(gripper_motor_id)
+
+        if not self._gripper_motion_mode:
+            self._driver.disable_motor(gripper_motor_id, clear_fault=False)
+            time.sleep(0.01)
+            if not self._driver.set_run_mode(gripper_motor_id, RunMode.MOTION_CONTROL):
+                logger.error("夹爪电机设置运控模式失败")
+                return False
+            time.sleep(0.01)
+            if not self._driver.enable_motor(gripper_motor_id):
+                logger.error("夹爪电机使能失败")
+                return False
+            time.sleep(0.01)
+            self._gripper_motion_mode = True
 
         if self._control_running:
             with self._cmd_lock:
                 self._target_gripper = gripper_angle
-                self._gripper_dirty = True
+                self._target_gripper_effort = gripper_effort
+                self._target_gripper_kp = kp if kp is not None else self._position_kp
+                self._target_gripper_kd = kd if kd is not None else self._position_kd
+                self._gripper_active = True
             return True
 
-        return self._driver.set_position_pp(gripper_motor_id, gripper_angle)
+        return self._driver.send_motion_control(
+            gripper_motor_id,
+            gripper_angle,
+            0.0,
+            kp if kp is not None else self._position_kp,
+            kd if kd is not None else self._position_kd,
+            gripper_effort,
+        )
 
     # ================================================================
     # 零力矩模式
@@ -1607,6 +1651,50 @@ class ELA3Interface:
         if block:
             return self.wait_for_motion()
         return True
+
+    def PlayRecordedTrajectory(self, recorded_points: Sequence, block: bool = True) -> bool:
+        """
+        按录制时间戳回放示教轨迹。
+
+        recorded_points: 具有 timestamp 和 positions 属性的点序列，
+        positions 至少包含前 6 个关节角(rad)。
+        """
+        if not self._connected:
+            logger.error("未连接")
+            return False
+
+        points = [pt for pt in recorded_points if len(getattr(pt, "positions", [])) >= self.NUM_ARM_JOINTS]
+        if len(points) < 2:
+            logger.error("示教轨迹点数不足")
+            return False
+
+        first_time = float(getattr(points[0], "timestamp", 0.0))
+        traj_points = []
+        prev_time = 0.0
+        for idx, pt in enumerate(points):
+            t = max(0.0, float(getattr(pt, "timestamp", 0.0)) - first_time)
+            if idx > 0 and t <= prev_time:
+                t = prev_time + self._control_period
+            prev_time = t
+
+            positions = [
+                clamp(float(v), *self._joint_limits.get(i + 1, (-6.28, 6.28)))
+                if self._joint_limit_enabled else float(v)
+                for i, v in enumerate(pt.positions[:self.NUM_ARM_JOINTS])
+            ]
+            traj_points.append(TrajectoryPoint(
+                time=t,
+                positions=positions,
+                velocities=[0.0] * self.NUM_ARM_JOINTS,
+                accelerations=[0.0] * self.NUM_ARM_JOINTS,
+            ))
+
+        fill_trajectory_derivatives(traj_points, self.NUM_ARM_JOINTS)
+
+        if not self._control_running:
+            self.start_control_loop(rate_hz=self._control_rate_hz)
+
+        return self._execute_trajectory_async(traj_points, block=block)
 
     def is_moving(self) -> bool:
         """查询是否有正在执行的轨迹"""
