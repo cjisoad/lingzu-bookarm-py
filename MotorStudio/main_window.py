@@ -139,7 +139,8 @@ class MainWindow(QMainWindow):
         tm.theme_changed.connect(lambda _: self.rodmotor_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.gamepad_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.tcp_panel.retranslate_ui())
-        tm.theme_changed.connect(lambda _: self.point_cloud_panel.apply_theme())
+        tm.theme_changed.connect(lambda _: self.book_takeout_panel.apply_theme())
+        tm.theme_changed.connect(lambda _: self.book_putback_panel.apply_theme())
 
         QTimer.singleShot(500, self._init_3d_model)
         if self._sim_mode:
@@ -190,10 +191,15 @@ class MainWindow(QMainWindow):
         self.tcp_panel = TcpPanel()
         self.tabs.addTab(self.tcp_panel, tr("tab.tcp"))
 
-        self.point_cloud_panel = RealSensePointPanel()
-        self.tabs.addTab(self.point_cloud_panel, tr("tab.point_cloud"))
-        self.point_cloud_viewer = self.point_cloud_panel.viewer_widget()
-        self.left_stack.addWidget(self.point_cloud_viewer)
+        self.book_takeout_panel = RealSensePointPanel(workflow_mode="takeout")
+        self.tabs.addTab(self.book_takeout_panel, tr("tab.book_takeout"))
+        self.book_takeout_viewer = self.book_takeout_panel.viewer_widget()
+        self.left_stack.addWidget(self.book_takeout_viewer)
+
+        self.book_putback_panel = RealSensePointPanel(workflow_mode="putback")
+        self.tabs.addTab(self.book_putback_panel, tr("tab.book_putback"))
+        self.book_putback_viewer = self.book_putback_panel.viewer_widget()
+        self.left_stack.addWidget(self.book_putback_viewer)
 
         self.teaching_panel = TeachingPanel()
         self.tabs.addTab(self.teaching_panel, tr("tab.teaching"))
@@ -234,7 +240,8 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(tr("win.ready"))
 
-        self._point_cloud_tab_index = self.tabs.indexOf(self.point_cloud_panel)
+        self._book_takeout_tab_index = self.tabs.indexOf(self.book_takeout_panel)
+        self._book_putback_tab_index = self.tabs.indexOf(self.book_putback_panel)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self._sync_left_view_for_tab(self.tabs.currentIndex())
         QTimer.singleShot(0, lambda: self._adjust_dock_sizes(self.viewer_dock, self.tabs_dock))
@@ -254,7 +261,8 @@ class MainWindow(QMainWindow):
         self.worker.enabled_changed.connect(tb.set_enabled)
         self.worker.enabled_changed.connect(self.joint_panel.set_enabled)
         self.worker.enabled_changed.connect(self.viewer_3d.set_enabled)
-        self.worker.enabled_changed.connect(self.point_cloud_panel.set_arm_enabled)
+        self.worker.enabled_changed.connect(self.book_takeout_panel.set_arm_enabled)
+        self.worker.enabled_changed.connect(self.book_putback_panel.set_arm_enabled)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.log_message.connect(self._append_log)
         self.worker.can_fps_updated.connect(tb.set_fps)
@@ -263,7 +271,8 @@ class MainWindow(QMainWindow):
         self.worker.joints_updated.connect(self._on_joints_updated)
         self.worker.efforts_updated.connect(self._on_efforts_updated)
         self.worker.end_pose_updated.connect(self.trajectory_panel.update_current_end_pose)
-        self.worker.end_pose_updated.connect(self.point_cloud_panel.update_current_end_pose)
+        self.worker.end_pose_updated.connect(self.book_takeout_panel.update_current_end_pose)
+        self.worker.end_pose_updated.connect(self.book_putback_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.viewer_3d.update_tcp_point)
         self.worker.tcp_offset_updated.connect(self.tcp_panel.set_tcp_offset)
         self.worker.motor_feedback_updated.connect(
@@ -292,52 +301,27 @@ class MainWindow(QMainWindow):
         tcp.tcp_apply_requested.connect(
             lambda offset: self.worker.submit_command("set_tcp_offset", offset)
         )
-        tcp.tcp_apply_requested.connect(self.point_cloud_panel.set_tcp_offset)
+        tcp.tcp_apply_requested.connect(self.book_takeout_panel.set_tcp_offset)
+        tcp.tcp_apply_requested.connect(self.book_putback_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(
             lambda offset: self.worker.submit_command("save_tcp_offset", offset)
         )
-        tcp.tcp_save_requested.connect(self.point_cloud_panel.set_tcp_offset)
+        tcp.tcp_save_requested.connect(self.book_takeout_panel.set_tcp_offset)
+        tcp.tcp_save_requested.connect(self.book_putback_panel.set_tcp_offset)
         tcp.tcp_restore_requested.connect(
             lambda: self.worker.submit_command("restore_tcp_offset")
         )
         tcp.tcp_restore_requested.connect(
-            lambda: self.point_cloud_panel.set_tcp_offset([0.0] * 6)
+            lambda: self.book_takeout_panel.set_tcp_offset([0.0] * 6)
         )
-        self.worker.tcp_offset_updated.connect(self.point_cloud_panel.set_tcp_offset)
+        tcp.tcp_restore_requested.connect(
+            lambda: self.book_putback_panel.set_tcp_offset([0.0] * 6)
+        )
+        self.worker.tcp_offset_updated.connect(self.book_takeout_panel.set_tcp_offset)
+        self.worker.tcp_offset_updated.connect(self.book_putback_panel.set_tcp_offset)
 
-        pc = self.point_cloud_panel
-        pc.move_l_requested.connect(
-            lambda pose, dur: self.worker.submit_command("move_l", pose, dur)
-        )
-        pc.move_l_block_requested.connect(
-            lambda pose, dur: self.worker.submit_command("move_l_block", pose, dur)
-        )
-        pc.move_j_block_requested.connect(
-            lambda joints, dur: self.worker.submit_command("move_j_block", joints, dur)
-        )
-        pc.gripper_requested.connect(
-            lambda angle, effort, kp, kd: self.worker.submit_command(
-                "gripper_ctrl", angle, effort, kp, kd
-            )
-        )
-        pc.rod_connect_requested.connect(
-            lambda port, baud, timeout: self.rodmotor_worker.submit_command(
-                "connect", port, baud, timeout
-            )
-        )
-        pc.rod_write_requested.connect(
-            lambda angle, spd, acc, torque: self.rodmotor_worker.submit_command(
-                "write_angle", angle, spd, acc, torque
-            )
-        )
-        self.worker.move_l_done.connect(pc.notify_move_l_done)
-        self.worker.move_j_done.connect(pc.notify_move_j_done)
-        self.rodmotor_worker.connected_changed.connect(pc.set_rod_connected)
-        self.rodmotor_worker.write_done.connect(pc.notify_rod_write_done)
-        self.worker.error_occurred.connect(pc.notify_flow_error)
-        self.rodmotor_worker.error_occurred.connect(pc.notify_flow_error)
-        pc.log_message.connect(self._append_log)
-        pc.error_occurred.connect(self._on_error)
+        self._connect_point_workflow_panel(self.book_takeout_panel)
+        self._connect_point_workflow_panel(self.book_putback_panel)
 
         teach = self.teaching_panel
         teach.zero_torque_requested.connect(
@@ -428,6 +412,45 @@ class MainWindow(QMainWindow):
         self.gamepad_panel.gamepad_log.connect(self._append_log)
         self.worker.connected_changed.connect(self._on_connected_for_gamepad)
 
+    def _connect_point_workflow_panel(self, panel: RealSensePointPanel):
+        panel.move_l_requested.connect(
+            lambda pose, dur: self.worker.submit_command("move_l", pose, dur)
+        )
+        panel.move_l_block_requested.connect(
+            lambda pose, dur: self.worker.submit_command("move_l_block", pose, dur)
+        )
+        panel.move_j_block_requested.connect(
+            lambda joints, dur: self.worker.submit_command("move_j_block", joints, dur)
+        )
+        panel.end_pose_block_requested.connect(
+            lambda pose, dur: self.worker.submit_command("end_pose_block", *pose, duration=dur)
+        )
+        panel.gripper_requested.connect(
+            lambda angle, effort, kp, kd: self.worker.submit_command(
+                "gripper_ctrl", angle, effort, kp, kd
+            )
+        )
+        panel.rod_connect_requested.connect(
+            lambda port, baud, timeout: self.rodmotor_worker.submit_command(
+                "connect", port, baud, timeout
+            )
+        )
+        panel.rod_write_requested.connect(
+            lambda angle, spd, acc, torque: self.rodmotor_worker.submit_command(
+                "write_angle", angle, spd, acc, torque
+            )
+        )
+        self.worker.move_l_done.connect(panel.notify_move_l_done)
+        self.worker.move_j_done.connect(panel.notify_move_j_done)
+        self.worker.end_pose_done.connect(panel.notify_end_pose_done)
+        self.rodmotor_worker.connected_changed.connect(panel.set_rod_connected)
+        self.rodmotor_worker.angle_updated.connect(panel.notify_rod_angle_updated)
+        self.rodmotor_worker.write_done.connect(panel.notify_rod_write_done)
+        self.worker.error_occurred.connect(panel.notify_flow_error)
+        self.rodmotor_worker.error_occurred.connect(panel.notify_flow_error)
+        panel.log_message.connect(self._append_log)
+        panel.error_occurred.connect(self._on_error)
+
     # ---- retranslate ----
 
     def _retranslate_ui(self):
@@ -441,17 +464,18 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(0, tr("tab.joint"))
         self.tabs.setTabText(1, tr("tab.trajectory"))
         self.tabs.setTabText(2, tr("tab.tcp"))
-        self.tabs.setTabText(3, tr("tab.point_cloud"))
-        self.tabs.setTabText(4, tr("tab.teaching"))
-        self.tabs.setTabText(5, tr("tab.diagnostics"))
-        self.tabs.setTabText(6, tr("tab.gripper"))
-        self.tabs.setTabText(7, tr("tab.rodmotor"))
-        self.tabs.setTabText(8, tr("tab.gamepad"))
+        self.tabs.setTabText(3, tr("tab.book_takeout"))
+        self.tabs.setTabText(4, tr("tab.book_putback"))
+        self.tabs.setTabText(5, tr("tab.teaching"))
+        self.tabs.setTabText(6, tr("tab.diagnostics"))
+        self.tabs.setTabText(7, tr("tab.gripper"))
+        self.tabs.setTabText(8, tr("tab.rodmotor"))
+        self.tabs.setTabText(9, tr("tab.gamepad"))
 
         for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
-                      self.tcp_panel, self.point_cloud_panel, self.teaching_panel,
-                      self.diagnostics_panel, self.gripper_panel, self.rodmotor_panel,
-                      self.gamepad_panel, self.viewer_3d):
+                      self.tcp_panel, self.book_takeout_panel, self.book_putback_panel,
+                      self.teaching_panel, self.diagnostics_panel, self.gripper_panel,
+                      self.rodmotor_panel, self.gamepad_panel, self.viewer_3d):
             if hasattr(panel, "retranslate_ui"):
                 panel.retranslate_ui()
         self.monitoring_window.retranslate_ui()
@@ -488,10 +512,25 @@ class MainWindow(QMainWindow):
         self._sync_left_view_for_tab(index)
 
     def _sync_left_view_for_tab(self, index: int):
-        if index == getattr(self, "_point_cloud_tab_index", -1):
-            self.left_stack.setCurrentWidget(self.point_cloud_viewer)
+        if index == getattr(self, "_book_takeout_tab_index", -1):
+            self.left_stack.setCurrentWidget(self.book_takeout_viewer)
             self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
-            self.point_cloud_panel.show_viewer()
+            self.book_takeout_panel.show_viewer()
+            self.book_putback_panel.hide_viewer()
+            QTimer.singleShot(
+                0,
+                lambda: self._adjust_dock_sizes(
+                    self.viewer_dock,
+                    self.tabs_dock,
+                    left_ratio=0.68,
+                ),
+            )
+            return
+        if index == getattr(self, "_book_putback_tab_index", -1):
+            self.left_stack.setCurrentWidget(self.book_putback_viewer)
+            self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
+            self.book_putback_panel.show_viewer()
+            self.book_takeout_panel.hide_viewer()
             QTimer.singleShot(
                 0,
                 lambda: self._adjust_dock_sizes(
@@ -503,7 +542,8 @@ class MainWindow(QMainWindow):
             return
         self.left_stack.setCurrentWidget(self.viewer_3d)
         self.viewer_dock.setWindowTitle(tr("win.viewer"))
-        self.point_cloud_panel.hide_viewer()
+        self.book_takeout_panel.hide_viewer()
+        self.book_putback_panel.hide_viewer()
         QTimer.singleShot(
             0,
             lambda: self._adjust_dock_sizes(
@@ -563,7 +603,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._append_log(tr("win.closing"))
         self.gamepad_panel.cleanup()
-        self.point_cloud_panel.cleanup()
+        self.book_takeout_panel.cleanup()
+        self.book_putback_panel.cleanup()
         if self.monitoring_window.isVisible():
             self.monitoring_window.close()
         if self.worker.is_connected:

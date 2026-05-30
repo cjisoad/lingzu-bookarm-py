@@ -26,7 +26,17 @@ _STRINGS: dict[str, dict[str, str]] = {
     "tab.diagnostics":      {"zh": "电机诊断",   "en": "Diagnostics"},
     "tab.gripper":          {"zh": "夹爪",       "en": "Gripper"},
     "tab.gamepad":          {"zh": "手柄",       "en": "Gamepad"},
-    "tab.point_cloud":       {"zh": "点云选点",   "en": "Point Cloud"},
+    "tab.book_takeout":     {"zh": "书籍取出",   "en": "Book Takeout"},
+    "tab.book_putback":     {"zh": "书籍放回",   "en": "Book Putback"},
+    "pc.book_takeout_group": {"zh": "书籍取出流程", "en": "Book Takeout Workflow"},
+    "pc.book_putback_group": {"zh": "书籍放回流程", "en": "Book Putback Workflow"},
+    "pc.workflow_reset":    {"zh": "重置流程",     "en": "Reset Workflow"},
+    "pc.workflow_back":     {"zh": "回退到上一步位置", "en": "Rollback One Step"},
+    "pc.workflow_detect":   {"zh": "识别书籍",     "en": "Detect Book"},
+    "pc.workflow_steps":    {"zh": "查看完整流程", "en": "View Full Workflow"},
+    "pc.workflow_next":     {"zh": "开始/执行下一步", "en": "Start / Next Step"},
+    "pc.workflow_target":   {"zh": "目标点: --",   "en": "Target: --"},
+    "pc.workflow_pending":  {"zh": "流程未开始",   "en": "Workflow not started"},
     "tab.rodmotor":         {"zh": "杆电机",     "en": "Rod Motor"},
 
     # ── toolbar ──

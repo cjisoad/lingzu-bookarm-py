@@ -49,6 +49,7 @@ class ArmWorker(QThread):
     motor_scan_result = pyqtSignal(list)
     move_j_done = pyqtSignal()
     move_l_done = pyqtSignal()
+    end_pose_done = pyqtSignal()
     tcp_offset_updated = pyqtSignal(object)
 
     def __init__(self, parent=None):
@@ -140,6 +141,8 @@ class ArmWorker(QThread):
             self._do_move_l(*args, block=True, **kwargs)
         elif cmd == "end_pose_ctrl":
             self._do_end_pose_ctrl(*args, **kwargs)
+        elif cmd == "end_pose_block":
+            self._do_end_pose_block(*args, **kwargs)
         elif cmd == "cancel_motion":
             self._do_cancel_motion()
         elif cmd == "zero_torque":
@@ -417,6 +420,30 @@ class ArmWorker(QThread):
         if self.arm and self._enabled:
             self._ensure_control_loop()
             self.arm.EndPoseCtrl(x, y, z, rx, ry, rz, duration=duration)
+
+    def _do_end_pose_block(self, x, y, z, rx, ry, rz, duration=2.0):
+        if self._sim_mode:
+            target_pose = ArmEndPose(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz)
+            q_target = self._solve_sim_ik(target_pose)
+            if q_target is None:
+                self.error_occurred.emit("EndPoseCtrl IK 失败（模拟）")
+                return
+            self._sim_target = list(q_target[:6]) + [self._sim_target[6]]
+            self.log_message.emit(
+                f"EndPoseCtrl（模拟 IK）[{x * 100.0:.2f}cm,{y * 100.0:.2f}cm,{z * 100.0:.2f}cm]"
+            )
+            import time as _t
+
+            _t.sleep(min(float(duration), 2.0))
+            self.end_pose_done.emit()
+            return
+        if self.arm and self._enabled:
+            self._ensure_control_loop()
+            ok = self.arm.EndPoseCtrl(x, y, z, rx, ry, rz, duration=duration)
+            if ok:
+                self.end_pose_done.emit()
+            else:
+                self.error_occurred.emit("EndPoseCtrl 执行失败，请检查目标位姿是否可达")
 
     def _do_cancel_motion(self):
         if self._sim_mode:

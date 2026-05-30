@@ -1485,6 +1485,17 @@ class ELA3Interface:
         profiles = planner.plan_sync(start_q, positions[:self.NUM_ARM_JOINTS])
         dt = self._control_period if self._control_running else 0.005
         traj = planner.generate_trajectory(profiles, dt=dt)
+        requested_duration = max(float(duration), dt)
+        natural_duration = traj[-1].time if traj else 0.0
+        if natural_duration > 1e-9:
+            motion_duration = max(requested_duration, natural_duration)
+            if motion_duration > natural_duration + 1e-9:
+                scale = motion_duration / natural_duration
+                for pt in traj:
+                    pt.time *= scale
+                fill_trajectory_derivatives(traj, self.NUM_ARM_JOINTS)
+        elif traj:
+            traj[0].time = requested_duration
 
         if self._control_running:
             n_hold = max(1, int(0.05 / dt))
